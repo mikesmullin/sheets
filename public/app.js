@@ -11,12 +11,11 @@ const MAX_ROW_HEIGHT = 480
 const DEFAULT_COL_WIDTH = 180
 const MIN_COL_WIDTH = 60
 const MAX_COL_WIDTH = 960
-// Virtual scroll (Option A + GROK1): big overscan, page cache, rAF-only updates.
-// Server caps /api/entities limit at 500 — at/under that we full-load once and use
-// native scroll (no mid-fling window commits). Above that, edge-triggered windows.
+// Virtual scroll: fixed ROWH math when windowing, rAF scroll handling, deferred
+// M.redraw while flinging. No multi-page row cache — mutations always refetch.
+// Server caps /api/entities limit at 500 — at/under that we full-load and use
+// native scroll. Above that, edge-triggered windows with a direct range fetch.
 const V_OVERSCAN = 32          // rows above/below viewport (fling headroom)
-const V_PAGE = 48              // cache granularity
-const V_PAGE_CACHE_MAX = 24    // max pages retained (~1k rows)
 const V_FULL_LOAD_MAX = 500    // match server limit; paint all rows, never shift window
 const V_SCROLL_IDLE_MS = 160   // after this quiet period, flush deferred redraws
 const normalizeRowHeight = (height) => {
@@ -423,10 +422,9 @@ function createApp() {
     }
     return params
   },
-  // ---- virtual scroll window (Option A: page cache + predictive fetch) ----
-  // GROK1_SCROLL: fixed ROWH math, big velocity-biased overscan, rAF-only heavy
-  // work, rock-solid totalBodyH spacer, GPU translate3d on tbody (no top/left).
-  // Server caps /api/entities limit at 500 — keep fetches page-aligned under that.
+  // ---- virtual scroll window (no multi-page cache) ----
+  // GROK1: fixed ROWH when windowing, rAF scroll, rock-solid totalBodyH, translate3d.
+  // Mutations call refreshWindow → reload:true so we always re-fetch (never serve stale rows).
   _windowCacheKey() {
     return JSON.stringify({
       a: this.actSlug ?? '',
@@ -435,160 +433,44 @@ function createApp() {
       f: this.colFilters ?? {},
     })
   },
-  _invalidateWindowCache() {
-    this._pageCache = new Map()
-    this._pageInflight = new Map() // pageIndex -> Promise
+  _invalidateWindowState() {
     this._windowKey = this._windowCacheKey()
     this._windowGen = (this._windowGen ?? 0) + 1
     this._totalKnown = false
     this._fullLoaded = false
+    this._fetchInflight = null
   },
   // Small sheets: one fetch, paint every row, native scroll only (no window shifts).
   _canFullLoad() {
-    return this._totalKnown && this.total > 0 && this.total <= V_FULL_LOAD_MAX
+    return this._totalKnown && this.total >= 0 && this.total <= V_FULL_LOAD_MAX
   },
-  _getPage(pageIndex) {
-    if (!this._pageCache) this._pageCache = new Map()
-    const hit = this._pageCache.get(pageIndex)
-    if (!hit || hit.key !== this._windowKey) return null
-    return hit
-  },
-  _touchPage(pageIndex) {
-    // Move key to end so Map order approximates LRU.
-    if (!this._pageCache?.has(pageIndex)) return
-    const hit = this._pageCache.get(pageIndex)
-    this._pageCache.delete(pageIndex)
-    this._pageCache.set(pageIndex, hit)
-  },
-  _putPages(offset, rows, total, key) {
-    if (!this._pageCache) this._pageCache = new Map()
-    if (key != null && key !== this._windowKey) return // stale response after invalidate
-    const storeKey = this._windowKey ?? this._windowCacheKey()
-    // Split into page-aligned chunks (fetch offsets are always page-aligned).
-    for (let i = 0; i < rows.length; ) {
-      const abs = offset + i
-      const pageIndex = Math.floor(abs / V_PAGE)
-      const pageStart = pageIndex * V_PAGE
-      const skip = abs - pageStart // 0 when aligned
-      const want = V_PAGE - skip
-      const slice = rows.slice(i, i + want)
-      if (slice.length === 0) break
-      // Only store when we filled from the page start (or this is a short final page).
-      if (skip === 0) {
-        this._pageCache.set(pageIndex, { key: storeKey, rows: slice, total, pageStart })
+  // Direct range fetch — no page cache. Concurrent callers share one in-flight promise
+  // only when the request range+key match; otherwise the newer gen wins.
+  async _fetchEntities(offset, limit) {
+    offset = Math.max(0, offset | 0)
+    limit = Math.max(0, Math.min(V_FULL_LOAD_MAX, limit | 0))
+    const keyAtStart = this._windowKey ?? this._windowCacheKey()
+    const genAtStart = this._windowGen ?? 0
+    try {
+      const params = await this.entityParams(offset, limit)
+      const data = await (await fetch(`/api/entities?${params}`)).json()
+      if ((this._windowGen ?? 0) !== genAtStart || this._windowKey !== keyAtStart) {
+        return null // stale after filter/activity change
       }
-      i += slice.length
-    }
-    // Empty dataset: still record page 0 so we don't refetch forever (total can be 0).
-    if (offset === 0 && rows.length === 0) {
-      this._pageCache.set(0, { key: storeKey, rows: [], total: total ?? 0, pageStart: 0 })
-    }
-    while (this._pageCache.size > V_PAGE_CACHE_MAX) {
-      const oldest = this._pageCache.keys().next().value
-      this._pageCache.delete(oldest)
-    }
-    if (typeof total === 'number' && Number.isFinite(total)) {
+      const total = data.total ?? 0
+      const rows = data.rows ?? []
+      const off = data.offset ?? offset
       this.total = total
       this._totalKnown = true
-      // Rock-solid spacer: only changes when server total changes, never mid-scroll.
       this.totalBodyH = Math.max(0, total * ROWH)
+      return { offset: off, rows, total }
+    } catch (err) {
+      console.error('window fetch failed', err)
+      return null
     }
-  },
-  _assembleRows(start, count) {
-    if (count <= 0) return []
-    const out = []
-    let at = start
-    const end = start + count
-    while (at < end) {
-      if (this._totalKnown && at >= this.total) break
-      const pageIndex = Math.floor(at / V_PAGE)
-      const page = this._getPage(pageIndex)
-      if (!page) return null
-      this._touchPage(pageIndex)
-      const pageStart = pageIndex * V_PAGE
-      const idx = at - pageStart
-      if (idx < 0 || idx >= page.rows.length) {
-        if (this._totalKnown && at >= this.total) break
-        // Short last page: stop cleanly when we've exhausted known rows.
-        if (page.rows.length < V_PAGE && idx >= page.rows.length) break
-        return null
-      }
-      const take = Math.min(page.rows.length - idx, end - at)
-      for (let i = 0; i < take; i++) out.push(page.rows[idx + i])
-      at += take
-      if (page.rows.length < V_PAGE) break
-    }
-    return out
-  },
-  _pageRangeFor(start, count) {
-    const end = start + Math.max(count, 1) - 1
-    const a = Math.floor(start / V_PAGE)
-    const b = Math.floor(Math.max(start, end) / V_PAGE)
-    return [a, b]
-  },
-  // Fetch [pageFrom, pageTo] inclusive. Shares in-flight promises so concurrent
-  // ensureWindow/prefetch never race-drop each other's responses.
-  async _fetchPageRange(pageFrom, pageTo) {
-    if (!this._pageInflight) this._pageInflight = new Map()
-    if (pageTo < pageFrom) return
-    // Cap span to server limit (500 rows).
-    const maxPages = Math.max(1, Math.floor(500 / V_PAGE))
-    if (pageTo - pageFrom + 1 > maxPages) pageTo = pageFrom + maxPages - 1
-
-    const waiters = []
-    let runStart = null
-    const kickRun = (from, to) => {
-      // One network request for a contiguous hole; every page in the hole shares the promise.
-      const keyAtStart = this._windowKey
-      const genAtStart = this._windowGen ?? 0
-      const pages = []
-      for (let p = from; p <= to; p++) pages.push(p)
-      const offset = from * V_PAGE
-      const limit = (to - from + 1) * V_PAGE
-      const promise = (async () => {
-        try {
-          const params = await this.entityParams(offset, limit)
-          const data = await (await fetch(`/api/entities?${params}`)).json()
-          if ((this._windowGen ?? 0) !== genAtStart || this._windowKey !== keyAtStart) return
-          this._putPages(data.offset ?? offset, data.rows ?? [], data.total ?? 0, keyAtStart)
-        } catch (err) {
-          console.error('window fetch failed', err)
-        } finally {
-          for (const p of pages) {
-            if (this._pageInflight.get(p) === promise) this._pageInflight.delete(p)
-          }
-        }
-      })()
-      for (const p of pages) this._pageInflight.set(p, promise)
-      waiters.push(promise)
-    }
-
-    for (let p = pageFrom; p <= pageTo; p++) {
-      if (this._getPage(p)) {
-        if (runStart != null) { kickRun(runStart, p - 1); runStart = null }
-        continue
-      }
-      const inflight = this._pageInflight.get(p)
-      if (inflight) {
-        if (runStart != null) { kickRun(runStart, p - 1); runStart = null }
-        waiters.push(inflight)
-        continue
-      }
-      if (runStart == null) runStart = p
-    }
-    if (runStart != null) kickRun(runStart, pageTo)
-    if (waiters.length) await Promise.all(waiters)
-  },
-  _prefetchPage(pageIndex) {
-    if (pageIndex < 0) return
-    if (this._totalKnown && pageIndex * V_PAGE >= this.total) return
-    if (this._getPage(pageIndex)) return
-    // Fire-and-forget; no redraw on prefetch alone.
-    this._fetchPageRange(pageIndex, pageIndex)
   },
   _visibleRange() {
     const el = document.querySelector('.gridwrap')
-    // Prefer live DOM scrollTop; _scrollTop can lag one event behind a fling.
     const live = el?.scrollTop
     const scrollTop = (live != null && !this._programmaticGridScroll)
       ? live
@@ -599,7 +481,6 @@ function createApp() {
     let overTop = V_OVERSCAN
     let overBot = V_OVERSCAN
     const vel = this._scrollVel ?? 0
-    // Bias overscan in fling direction (GROK1 #2).
     if (vel > 1.2) overBot = V_OVERSCAN * 2
     else if (vel < -1.2) overTop = V_OVERSCAN * 2
     const visibleFirst = Math.max(0, Math.floor(scrollTop / ROWH))
@@ -610,33 +491,33 @@ function createApp() {
     return { first, count, vel, scrollTop, visibleFirst, visibleLast, viewportRows }
   },
   // True when the currently painted window still covers the viewport + a safety margin.
-  // Avoids full M.redraw on every row of scroll (major recoil source).
   _windowCoversView(visibleFirst, visibleLast) {
     if (!this.rows?.length) return false
-    // Keep a cushion so we refresh before the user hits empty rows.
     const margin = Math.max(4, Math.min(12, V_OVERSCAN >> 2))
     const lo = this.winStart + margin
     const hi = this.winStart + this.rows.length - margin
-    if (hi <= lo) return false // painted range too small — always refresh
+    if (hi <= lo) return false
     return visibleFirst >= lo && visibleLast <= hi
   },
   _commitWindow(first, assembled, { force = false } = {}) {
-    const same =
-      first === this.winStart &&
-      assembled.length === this.rows.length &&
-      (assembled.length === 0 || (
-        assembled[0]?.id === this.rows[0]?.id &&
-        assembled[assembled.length - 1]?.id === this.rows[this.rows.length - 1]?.id
-      ))
-    if (same) return false
-    // During an active fling, never rebuild the DOM — that kills momentum (recoil).
-    // Queue a commit for scroll-idle unless force (initial load / filter reset).
-    if (!force && this._isGridScrollHot()) {
-      this._pendingWindow = true
-      this._pendingFirst = first
-      this._pendingAssembled = assembled
-      this._scheduleScrollIdleFlush()
-      return false
+    // force (reload/reset): always apply — row content may change with same ids/length.
+    if (!force) {
+      const same =
+        first === this.winStart &&
+        assembled.length === this.rows.length &&
+        (assembled.length === 0 || (
+          assembled[0]?.id === this.rows[0]?.id &&
+          assembled[assembled.length - 1]?.id === this.rows[this.rows.length - 1]?.id
+        ))
+      if (same) return false
+      // During an active fling, never rebuild the DOM — that kills momentum.
+      if (this._isGridScrollHot()) {
+        this._pendingWindow = true
+        this._pendingFirst = first
+        this._pendingAssembled = assembled
+        this._scheduleScrollIdleFlush()
+        return false
+      }
     }
     this.winStart = first
     this.rows = assembled
@@ -650,11 +531,12 @@ function createApp() {
     }
     return true
   },
-  async ensureWindow({ reset = false } = {}) {
-    // Coalesce concurrent callers (scroll rAF + refreshWindow + post-fetch).
+  async ensureWindow({ reset = false, reload = false } = {}) {
+    // Coalesce concurrent callers (scroll rAF + refreshWindow).
     if (this._ensureRunning) {
       this._ensureQueued = true
       if (reset) this._ensureReset = true
+      if (reload) this._ensureReload = true
       return this._ensurePromise
     }
     this._ensureRunning = true
@@ -662,16 +544,19 @@ function createApp() {
       try {
         let passes = 0
         do {
-          if (++passes > 12) break // safety: never spin on fetch holes
+          if (++passes > 8) break
           this._ensureQueued = false
           this._scrollDirty = false
           const doReset = reset || this._ensureReset
+          const doReload = reload || this._ensureReload || doReset
           this._ensureReset = false
+          this._ensureReload = false
           reset = false
+          reload = false
 
           const el = document.querySelector('.gridwrap')
           if (doReset) {
-            this._invalidateWindowCache()
+            this._invalidateWindowState()
             if (el) {
               this._programmaticGridScroll = true
               el.scrollTop = 0
@@ -680,79 +565,75 @@ function createApp() {
             this._scrollTop = 0
             this._scrollVel = 0
             this._lastScrollTop = 0
+          } else if (doReload) {
+            // Keep scroll and keep _fullLoaded so rowHeightMode stays rows-natural
+            // during the await — flipping to rows-fixed mid-reload collapses tall
+            // rows (row 2 "teleports" up, then down when heights restore).
+            this._windowGen = (this._windowGen ?? 0) + 1
           }
           const key = this._windowCacheKey()
-          if (key !== this._windowKey) this._invalidateWindowCache()
+          if (key !== this._windowKey) this._invalidateWindowState()
 
           // Bootstrap total if unknown.
           if (!this._totalKnown) {
-            await this._fetchPageRange(0, 0)
+            const boot = await this._fetchEntities(0, 1)
+            if (!boot) break
           }
 
-          // ---- Full-load path (≤500 rows): paint everything once, native scroll ----
-          if (this._canFullLoad()) {
-            if (!this._fullLoaded || doReset) {
-              const lastPage = Math.max(0, Math.ceil(this.total / V_PAGE) - 1)
-              await this._fetchPageRange(0, lastPage)
-              const assembled = this._assembleRows(0, this.total)
-              if (assembled && assembled.length === this.total) {
-                this._fullLoaded = true
-                this._commitWindow(0, assembled, { force: true })
-              } else if (assembled) {
-                // Partial (shouldn't happen for total≤500) — still paint what we have.
-                this._fullLoaded = assembled.length >= this.total
-                this._commitWindow(0, assembled, { force: true })
+          // ---- Full-load path (≤500 rows): paint everything; native scroll ----
+          // Re-fetch on reload (delete/duplicate/blank/etc). Scroll alone never re-fetches.
+          if (this._canFullLoad() || (doReload && this._fullLoaded)) {
+            if (!this._fullLoaded || doReload) {
+              const data = await this._fetchEntities(0, Math.max(this.total || 1, 1))
+              if (!data) break
+              // total may have grown past full-load — only then leave natural mode.
+              if (data.total > V_FULL_LOAD_MAX) {
+                this._fullLoaded = false
+                this._ensureQueued = true
+                continue
               }
+              this._fullLoaded = true
+              this._commitWindow(0, data.rows, { force: true })
             }
-            break // no mid-scroll window work
+            break
           }
           this._fullLoaded = false
 
-          // ---- Virtual path (total > 500) ----
-          let { first, count, vel, visibleFirst, visibleLast } = this._visibleRange()
+          // ---- Virtual path (total > 500): direct range fetch, no page cache ----
+          let { first, count, visibleFirst, visibleLast } = this._visibleRange()
 
-          // During hot scroll: only act if viewport is about to run out of rows.
-          if (!doReset && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) {
+          if (!doReload && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) {
+            break
+          }
+          if (!doReload && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
             break
           }
 
-          if (!doReset && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
-            const nearTop = visibleFirst < this.winStart + V_OVERSCAN
-            const nearBot = visibleLast > this.winStart + this.rows.length - V_OVERSCAN
-            if (nearBot) this._prefetchPage(Math.floor((this.winStart + this.rows.length) / V_PAGE) + 1)
-            if (nearTop) this._prefetchPage(Math.floor(this.winStart / V_PAGE) - 1)
-            break
+          // Cap request to server max.
+          if (count > V_FULL_LOAD_MAX) count = V_FULL_LOAD_MAX
+          const data = await this._fetchEntities(first, Math.max(count, 1))
+          if (!data) break
+
+          // Scroll may have moved during await.
+          ;({ first, count, visibleFirst, visibleLast } = this._visibleRange())
+          if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first), V_FULL_LOAD_MAX)
+
+          // If the response offset still matches what we need, use it; else re-fetch once.
+          let assembled
+          if (data.offset === first && data.rows.length >= Math.min(count, data.rows.length)) {
+            assembled = count < data.rows.length ? data.rows.slice(0, count) : data.rows
+            // If we asked for more than returned but total says more exist, clamp.
+            if (this.total > 0 && first + assembled.length > this.total) {
+              assembled = assembled.slice(0, Math.max(0, this.total - first))
+            }
+          } else {
+            const again = await this._fetchEntities(first, Math.max(count, 1))
+            if (!again) break
+            assembled = again.rows
           }
 
-          let [pageLo, pageHi] = this._pageRangeFor(first, count || V_PAGE)
-          await this._fetchPageRange(pageLo, pageHi)
-
-          ;({ first, count, vel, visibleFirst, visibleLast } = this._visibleRange())
-          if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
-
-          if (!doReset && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
-            break
-          }
-
-          const [needLo, needHi] = this._pageRangeFor(first, count || V_PAGE)
-          let needFetch = false
-          for (let p = needLo; p <= needHi; p++) {
-            if (this._totalKnown && p * V_PAGE >= this.total) continue
-            if (!this._getPage(p)) { needFetch = true; break }
-          }
-          if (needFetch) {
-            await this._fetchPageRange(needLo, needHi)
-            ;({ first, count, vel } = this._visibleRange())
-            if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
-          }
-
-          const assembled = this._assembleRows(first, count)
           if (assembled) {
-            // force only on reset; otherwise defer commit if mid-fling
-            this._commitWindow(first, assembled, { force: doReset })
-            const [lo, hi] = this._pageRangeFor(first, Math.max(count, 1))
-            if (vel >= 0) this._prefetchPage(hi + 1)
-            else this._prefetchPage(lo - 1)
+            this._commitWindow(first, assembled, { force: doReload || doReset })
           }
         } while (this._ensureQueued || this._scrollDirty)
       } finally {
@@ -762,9 +643,10 @@ function createApp() {
     })()
     return this._ensurePromise
   },
-  // Public API used across the app (filter/search/play refresh).
+  // Public API: reset=true → scroll to top + reload; false → reload in place (mutations).
   async refreshWindow(reset) {
-    await this.ensureWindow({ reset: !!reset })
+    if (reset) await this.ensureWindow({ reset: true })
+    else await this.ensureWindow({ reload: true })
   },
   onScroll(e) {
     // Ignore only our own programmatic restores (setting scrollTop after M.redraw).
@@ -782,7 +664,6 @@ function createApp() {
     this._scrollTop = top
     this._scrollLeft = el.scrollLeft
     this._gridUserScrollAt = now
-    // Keep idle-flush armed so deferred redraws land after the fling.
     this._scheduleScrollIdleFlush()
 
     // Full-load sheets: native scroll only — never ensureWindow/redraw on scroll.
@@ -797,8 +678,6 @@ function createApp() {
       this._scrollRaf = requestAnimationFrame(() => {
         this._scrollRaf = 0
         if (!this._scrollDirty) return
-        // Hot fling: defer window work to idle (unless buffer about to empty —
-        // ensureWindow itself no-ops when still covered).
         this.ensureWindow({ reset: false })
       })
     }
