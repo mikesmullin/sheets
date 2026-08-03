@@ -5,7 +5,7 @@
 import M from './m.js'
 import './hot-client.js'
 
-const ROWH = 28
+const ROWH = 40
 const MIN_ROW_HEIGHT = 22
 const MAX_ROW_HEIGHT = 480
 const DEFAULT_COL_WIDTH = 180
@@ -43,7 +43,7 @@ function createApp() {
   bodyOffsetY: 0, totalBodyH: 0,
   sel: { ranges: [], active: null, anchor: null },
   cellStates: {}, stagePending: {}, viewMods: {}, viewLoading: {},
-  wsConnected: false,
+  wsConnected: false, wsConnecting: false,
   desynced: false,
   q: { queued: 0, idle: 0, running: 0, done: 0, error: 0, concurrency: 0 },
   logs: [], conc: 0, dragging: null,
@@ -88,6 +88,8 @@ function createApp() {
   get fullColumns() { return this.act?.columns ?? [] },
   get columns() { return this.fullColumns.filter((c) => !c.hidden) },
   get columnPickerNeedle() { return this.columnPickerFilter.trim().toLowerCase() },
+  // Thinking/brain toggle is only meaningful for gemma models (e.g. lm-studio:google/gemma-4-12b-qat).
+  get chatModelSupportsThinking() { return /:.*gemma/i.test(this.chat.model ?? '') },
   get filteredStages() {
     const needle = this.columnPickerNeedle
     if (!needle) return this.stageTree ?? []
@@ -733,14 +735,11 @@ function createApp() {
     if (!res.ok) throw new Error(`views ${res.status}`)
     return res.text()
   },
-  async _importStageViewsCode(code) {
-    const blob = new Blob([code], { type: 'text/javascript' })
-    const blobUrl = URL.createObjectURL(blob)
-    try {
-      return await import(/* webpackIgnore: true */ blobUrl)
-    } finally {
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000)
-    }
+  async _importStageViews(slug, hash) {
+    // Real URL import: the browser resolves the module's own `../lib/*.mjs`
+    // relatives against /stagemod/stages/, and caches per version hash.
+    const url = `/stagemod/stages/${encodeURIComponent(slug)}.mjs?v=${hash}`
+    return await import(/* webpackIgnore: true */ url)
   },
   _hashStr(s) {
     // Cheap non-crypto hash for "did views.js change?"
@@ -774,7 +773,7 @@ function createApp() {
           this._viewSourceHash[slug] = hash
           return this.viewMods[slug]
         }
-        const m = await this._importStageViewsCode(code)
+        const m = await this._importStageViews(slug, hash)
         if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
         this.viewMods[slug] = m
         this._viewSourceHash[slug] = hash
@@ -2239,8 +2238,10 @@ function createApp() {
 
   // ---- websocket ----
   connectWS() {
+    this.wsConnecting = true
+    M.redraw()
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/run`)
-    ws.onopen = () => { this.wsConnected = true; M.redraw() }
+    ws.onopen = () => { this.wsConnecting = false; this.wsConnected = true; M.redraw() }
     ws.onmessage = (m) => {
       const ev = JSON.parse(m.data)
       if (ev.type === 'queue') { this.q = ev; if (!this.dragging) this.conc = ev.concurrency }
@@ -2259,6 +2260,7 @@ function createApp() {
       else if (ev.type === 'persisted') this.queuePersistedReload(ev)
     }
     ws.onclose = () => {
+      this.wsConnecting = false
       this.wsConnected = false
       M.redraw()
       setTimeout(() => this.connectWS(), 2000)
@@ -2899,7 +2901,7 @@ function createApp() {
   <div class="layout">
     <div class="main">
       <div class="toolbar">
-        <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : '')" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : 'disconnected from sheets server')" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span><button class="refresh-button" @click="refreshPersistent()" title="reload persistent files">↻</button>
+        <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : (wsConnecting ? 'connecting' : ''))" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : (wsConnecting ? 'connecting to sheets server' : 'disconnected from sheets server'))" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span><button class="refresh-button" @click="refreshPersistent()" title="reload persistent files">↻</button>
         <span x-text="meta ? meta.root.split('/').pop() : ''" style="color:var(--dim)"></span>
         <div class="dropdown" @click.outside="fieldMenu = false">
           <button class="toolbar-icon-btn toolbar-dropdown-btn" @click="toggleFieldMenu()" title="columns">
@@ -3291,7 +3293,7 @@ function createApp() {
             <select class="chat-dd effort-dd" :value="chat.reasoningEffort" @change="chatEffortChange($event)" title="reasoning effort">
               <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
             </select>
-            <button class="chat-icon-btn" :class="chat.thinking ? 'on' : ''" @click="toggleChatThinking()" title="toggle model thinking"><i class="ph-bold ph-brain" aria-hidden="true"></i></button>
+            <button class="chat-icon-btn" x-show="chatModelSupportsThinking" :class="chat.thinking ? 'on' : ''" @click="toggleChatThinking()" title="toggle model thinking"><i class="ph-bold ph-brain" aria-hidden="true"></i></button>
             <div class="context-meter" :style="'--context-pct:' + chatContextPct() + '%'" :title="chatContextTitle()"><span x-text="chatContextLabel()"></span></div>
             <button class="chat-icon-btn" :class="chat.toolsOpen ? 'on' : ''" @click="toggleChatTools()" title="tools for inference"><i class="ph-bold ph-wrench" aria-hidden="true"></i></button>
             <button class="chat-icon-btn" :class="chat.allowlistOpen ? 'on' : ''" @click="toggleChatAllowlist()" title="allowlist"><i class="ph-bold ph-shield-check" aria-hidden="true"></i></button>

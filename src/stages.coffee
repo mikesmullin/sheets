@@ -3,6 +3,7 @@
 # Convention: stage files have NO imports — everything arrives via ctx.
 import fs from 'node:fs'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import CoffeeScript from 'coffeescript'
 
 export class Stages
@@ -80,7 +81,11 @@ export class Stages
       throw err
     unless entry.mod
       try
-        url = 'data:text/javascript;base64,' + Buffer.from(entry.js).toString('base64')
+        compiledDir = path.join @ws.sheetsDir, '.compiled-stages'
+        fs.mkdirSync compiledDir, recursive: true
+        compiledFile = path.join compiledDir, "#{slug}.mjs"
+        fs.writeFileSync compiledFile, entry.js
+        url = "#{pathToFileURL(compiledFile).href}?v=#{entry.mtime}"
         entry.mod = await `import(url)`
       catch err
         entry.error = String(err?.message ? err)

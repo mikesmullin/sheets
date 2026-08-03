@@ -697,6 +697,30 @@ export startServer = (opts = {}) ->
       persisted 'activity', { slug: a.slug }
       return json { ok: true, slug, authored: false }
 
+    # Stage modules are served at real URLs that mirror the on-disk layout, so the
+    # browser's module loader resolves `../lib/*.mjs` natively (no blob/data URLs).
+    if m = p.match /^\/stagemod\/lib\/([\w.-]+)$/
+      libFile = path.join ws.sheetsDir, 'lib', m[1]
+      return new Response 'not found', status: 404 unless fs.existsSync libFile
+      return new Response fs.readFileSync(libFile, 'utf8'),
+        headers: { 'content-type': 'text/javascript', 'cache-control': 'no-cache' }
+
+    if m = p.match /^\/stagemod\/stages\/([\w-]+)\.mjs$/
+      js = stages.js m[1]
+      return new Response 'not found', status: 404 unless js?
+      # Stamp lib imports with the newest lib mtime so edits hot-reload without
+      # a hard refresh (the specifier itself is fixed in stage source).
+      libDir = path.join ws.sheetsDir, 'lib'
+      v = 0
+      if fs.existsSync libDir
+        for f in fs.readdirSync libDir
+          try
+            mt = fs.statSync(path.join libDir, f).mtimeMs
+            v = mt if mt > v
+      js = js.replace /(from\s+['"]\.\.\/lib\/[\w.-]+\.mjs)(['"])/g, "$1?v=#{Math.round v}$2"
+      return new Response js,
+        headers: { 'content-type': 'text/javascript', 'cache-control': 'no-cache' }
+
     if m = p.match /^\/api\/stage\/([\w-]+)\/views\.js$/
       js = stages.js m[1]
       return new Response 'not found', status: 404 unless js?
@@ -743,6 +767,17 @@ export startServer = (opts = {}) ->
     if p is '/api/queue/concurrency' and req.method is 'POST'
       body = await req.json()
       n = engine.setConcurrency body.n
+      # Persist as the new startup value so a restart keeps the operator's setting.
+      # Surgical line edit (not yaml.dump) so comments in config.yaml survive.
+      try
+        raw = if fs.existsSync ws.cfgPath then fs.readFileSync(ws.cfgPath, 'utf8') else ''
+        if /^concurrency:.*$/m.test raw
+          raw = raw.replace /^concurrency:.*$/m, "concurrency: #{n}"
+        else
+          raw = (if raw and not /\n$/.test raw then raw + '\n' else raw) + "concurrency: #{n}\n"
+        fs.writeFileSync ws.cfgPath, raw
+      catch err
+        console.error 'sheets: could not persist concurrency:', err.message
       return json { ok: true, concurrency: n }
 
     if p is '/api/queue/clear' and req.method is 'POST'

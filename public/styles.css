@@ -5,7 +5,7 @@
   --text: #d7dae0; --dim: #8b8f99; --accent: #4d9de0; --accent2: #62c48f;
   --queued: #b78a3c; --idle: #7a6db0; --running: #4d9de0; --done: #3f9d64; --error: #c25050;
   --link: #8ec8ff; --link-visited: #d2b3ff; --link-hover: #b7dcff;
-  --rowh: 28px; --magich: 30px; --rowhead-w: 150px;
+  --rowh: 40px; --magich: 30px; --rowhead-w: 150px;
 }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
@@ -36,7 +36,15 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); }
 .toolbar .title { font-weight: 600; margin-right: 8px; }
 .toolbar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--error); display: inline-block; margin-right: 2px; }
 .toolbar .dot.on { background: var(--done); }
+.toolbar .dot.connecting { background: var(--queued); animation: connection-pulse 1s ease-in-out infinite; }
 .toolbar .dot.desync { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; background: var(--error); color: #fff; font-size: 12px; font-weight: 700; }
+@keyframes connection-pulse {
+  0%, 100% { opacity: .45; box-shadow: 0 0 0 0 rgba(183, 138, 60, 0); }
+  50% { opacity: 1; box-shadow: 0 0 0 4px rgba(183, 138, 60, .22); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toolbar .dot.connecting { animation: none; }
+}
 .toolbar .desync-label { color: #e06b6b; font-weight: 600; }
 .toolbar .refresh-button { border: none; background: transparent; padding: 1px 4px; color: var(--dim); font-size: 16px; line-height: 1; }
 .toolbar .refresh-button:hover { color: var(--text); border: none; }

@@ -107,6 +107,13 @@ export class Store
     r = await @db.query "SELECT doc FROM entities WHERE source = $1 AND id = $2", [source, id]
     r.rows[0]?.doc ? null
 
+  # Hard ceiling on any single-query row fetch that returns full `doc` JSONB.
+  # A single large result set of JSONB docs can exhaust PGlite's WASM heap and
+  # permanently wedge the connection — every caller that needs "all rows" must
+  # go through a batched method (Store#allRows / Store#fieldPaths / Store#fieldSamples)
+  # instead of raising this ceiling.
+  MAX_SINGLE_QUERY_ROWS = 500
+
   window: (source, { offset = 0, limit = 100, orderPath = null, dir = 'asc', q = null } = {}) ->
     dirSql = if String(dir) is 'desc' then 'DESC' else 'ASC'
     params = [source]
@@ -117,7 +124,7 @@ export class Store
     order = "id #{dirSql}"
     if dot = sanitizePath orderPath
       order = "doc #>> '#{pgPathFor dot}' #{dirSql} NULLS LAST, id ASC"
-    params.push Math.max(0, limit | 0)
+    params.push Math.min(MAX_SINGLE_QUERY_ROWS, Math.max(0, limit | 0))
     params.push Math.max(0, offset | 0)
     r = await @db.query """
       SELECT id, doc FROM entities WHERE #{where}
@@ -165,12 +172,18 @@ export class Store
     Array.from(seen).sort()
 
   # Collect non-null sample values for component.field (type guessing).
-  fieldSamples: (source, component, field, limit = 200) ->
-    r = await @db.query "SELECT doc FROM entities WHERE source = $1 LIMIT $2", [source, limit]
+  # Read in bounded batches — same rationale as fieldPaths/allRows above.
+  fieldSamples: (source, component, field, sample = 200, batchSize = 100) ->
     out = []
-    for row in r.rows
-      v = row.doc?[component]?[field]
-      out.push v if v?
+    offset = 0
+    while offset < sample
+      limit = Math.min batchSize, sample - offset
+      r = await @db.query "SELECT doc FROM entities WHERE source = $1 ORDER BY id LIMIT $2 OFFSET $3", [source, limit, offset]
+      break unless r.rows.length
+      for row in r.rows
+        v = row.doc?[component]?[field]
+        out.push v if v?
+      offset += r.rows.length
     out
 
   close: -> await @db?.close()
