@@ -26,7 +26,10 @@ Commands:
 
 Global options:
   --db <dir>        entity database dir (default: ./db); may point at a brain
-                    or agent-pipeline db — config stays in ./.sheets either way
+                    or agent-pipeline db — config stays in ./.sheets either way.
+                    Repeatable: each --db is scanned for activities (or becomes
+                    one worksheet tab). Example:
+                      sheets serve --db ./fruits/db --db ./veggies/db
   --server <url>    attach to a running server (default: auto-discover via
                     .sheets/server.json; exits with advice if none is running)
   --json            machine-readable output
@@ -53,7 +56,7 @@ Options:
 """
 
 parseArgs = (argv) ->
-  args = { _: [] }
+  args = { _: [], db: [] }
   i = 0
   while i < argv.length
     a = argv[i]
@@ -63,11 +66,20 @@ parseArgs = (argv) ->
       args.help = true
     else if a is '-c' or a is '--concurrency'
       args.concurrency = argv[++i]
+    else if a is '--db'
+      # Repeatable: --db a --db b → args.db = ['a','b']
+      val = argv[++i]
+      args.db.push val if val?
     else if a.startsWith '--'
       args[a.slice 2] = argv[++i]
     else
       args._.push a
     i++
+  # Keep a single string when only one --db (back-compat for callers that read args.db as string).
+  if args.db.length is 0
+    delete args.db
+  else if args.db.length is 1
+    args.db = args.db[0]
   args
 
 die = (msg) ->
@@ -272,7 +284,8 @@ cmdInit = (ws) ->
   unless fs.existsSync path.join ws.activitiesDir, 'sheet1.yaml'
     fs.writeFileSync path.join(ws.activitiesDir, 'sheet1.yaml'),
       yaml.dump { title: 'Sheet1', rows: { source: (path.relative(ws.root, ws.db) or 'db') }, columns: [] }
-  fs.mkdirSync ws.db, recursive: true
+  for dir in (ws.dbs ? [ws.db])
+    fs.mkdirSync dir, recursive: true
   process.stdout.write "initialized sheets workspace at #{ws.root}\n"
 
 cmdClean = (ws) ->

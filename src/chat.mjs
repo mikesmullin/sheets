@@ -22,8 +22,47 @@ export function createChatApi(ws, deps) {
   let toolsState = { enabled: null, baseline: null, overridden: false, initialized: false }
   let thinking = false
   let reasoningEffort = 'medium'
+  // Stage slugs written during the current chat turn (so we can notify even if fs.watch misses).
+  let stagesWrittenThisTurn = new Set()
 
   const send = (obj) => { try { sink?.(obj) } catch {} }
+
+  // Resolve a stage slug from a tool path/arg written by file_io__write_file.
+  function stageSlugFromPath(p) {
+    if (!p) return null
+    const s = String(p).replace(/\\/g, '/')
+    // Accept .sheets/stages/foo.coffee, absolute …/stages/foo.coffee, stages/foo.coffee
+    const m = s.match(/(?:^|\/)(?:\.sheets\/)?stages\/([\w-]+)\.coffee$/i)
+    return m?.[1] ?? null
+  }
+
+  function notifyStageWritten(slug) {
+    if (!slug) return
+    stagesWrittenThisTurn.add(slug)
+    try { deps.stages?.invalidate?.(slug) } catch {}
+    try { deps.onStageWritten?.(slug) } catch (e) {
+      console.error('sheets chat: onStageWritten failed', e)
+    }
+  }
+
+  // Angela tool_call/tool_result → if she wrote a stage file, invalidate + push WS.
+  function noteToolEvent(ev) {
+    if (!ev || (ev.type !== 'tool_call' && ev.type !== 'tool_result')) return
+    const name = String(ev.name ?? ev.tool ?? '')
+    if (!/write_file/i.test(name)) return
+    // Prefer path from args (tool_call). tool_result may only have text.
+    const args = ev.args ?? ev.input ?? {}
+    const candidates = [args.path, args.file, args.filepath, args.file_path]
+    for (const c of candidates) {
+      const slug = stageSlugFromPath(c)
+      if (slug) { notifyStageWritten(slug); return }
+    }
+    // Fallback: parse path out of result text if present
+    if (ev.text) {
+      const m = String(ev.text).match(/(?:^|[\s'"`])((?:\.?\/)?(?:\.sheets\/)?stages\/[\w-]+\.coffee)/)
+      if (m) notifyStageWritten(stageSlugFromPath(m[1]))
+    }
+  }
 
   async function loadDefinition(agentName = 'angela') {
     const { loadAgent } = await lib()
@@ -127,6 +166,8 @@ export function createChatApi(ws, deps) {
       onEvent: (ev) => {
         if (!ev || ev.type === 'provider_response') return
         if (ev.type === 'approval_needed') return
+        // Stage file writes: invalidate compile cache + notify SPA via deps.onStageWritten.
+        noteToolEvent(ev)
         if (ev.type === 'assistant_delta' || ev.type === 'reasoning_delta') send({ type: ev.type, text: ev.text })
         else send({ type: 'event', event: ev })
       },
@@ -256,12 +297,28 @@ export function createChatApi(ws, deps) {
     const stream = new ReadableStream({
       async start(controller) {
         sink = (obj) => controller.enqueue(enc.encode(JSON.stringify(obj) + '\n'))
+        stagesWrittenThisTurn = new Set()
         try {
           const h = await ensureHarness(body.agent, body.model)
           if (!session || body.newSession) session = await h.session.create({ title: body.title ?? 'sheets' })
           send({ type: 'session', id: session.id ?? null, agent: agentDef?.name ?? 'angela', model: activeModel, contextWindow: Number(agentDef?.contextWindow ?? 32768) })
           const res = await session.run({ prompt: prompt + suffix })
           const text = typeof res === 'string' ? res : (res?.text ?? res?.content ?? '')
+          // If the focused stage was edited but tool args lacked a path, still notify once.
+          if (body.stage && stagesWrittenThisTurn.size === 0) {
+            // Only if file mtime is recent (written in this turn window).
+            try {
+              const f = deps.stages?.file?.(body.stage)
+              if (f && fs.existsSync(f)) {
+                const age = Date.now() - fs.statSync(f).mtimeMs
+                if (age < 60_000) notifyStageWritten(body.stage)
+              }
+            } catch {}
+          }
+          // Tell the chat client which stages changed so it can refresh even if WS is down.
+          if (stagesWrittenThisTurn.size) {
+            send({ type: 'stages_updated', slugs: [...stagesWrittenThisTurn] })
+          }
           send({ type: 'done', text, model: activeModel })
         } catch (err) {
           console.error('sheets chat: run failed:', err)

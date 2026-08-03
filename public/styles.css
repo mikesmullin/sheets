@@ -259,14 +259,24 @@ table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 .magic-cell .mtitle.stage { color: var(--accent2); }
 .magic-cell .mtitle.field { color: var(--dim); }
 .magic-cell { position: relative; }
+/* Empty-column prompt: input + sparkle always together (sparkle immediately to the right). */
+.magic-cell .magic-prompt { display: flex; flex: 1; min-width: 0; align-items: center; gap: 4px; }
+.magic-cell .magic-prompt-input { flex: 1; min-width: 40px; }
+.magic-cell .magic-prompt .angela-send {
+  flex: 0 0 auto; width: 20px; height: 20px; min-width: 20px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  line-height: 1; visibility: visible; opacity: 1;
+  border-radius: 4px; color: #e8c56a; border-color: rgba(232, 197, 106, .35);
+  background: rgba(232, 197, 106, .1);
+}
+.magic-cell .magic-prompt .angela-send:hover {
+  border-color: rgba(232, 197, 106, .65); background: rgba(232, 197, 106, .18);
+}
 .magic-cell .actions { display: flex; gap: 2px; flex-shrink: 0; }
-/* Move / send: only while hovering the column (or menu open for send still hover-only). */
-.magic-cell .actions .col-move,
-.magic-cell .actions .angela-send { visibility: hidden; }
+/* Move: only while hovering the column. */
+.magic-cell .actions .col-move { visibility: hidden; }
 .grid tr.magic th:hover .actions .col-move,
-.grid tr.magic th:hover .actions .angela-send,
-.grid tr.magic th.filter-open .actions .col-move,
-.grid tr.magic th.filter-open .actions .angela-send { visibility: visible; }
+.grid tr.magic th.filter-open .actions .col-move { visibility: visible; }
 /* Filter: hover always; stay visible when filter/sort active or menu open. */
 .magic-cell .actions .filter-btn { visibility: hidden; }
 .grid tr.magic th:hover .actions .filter-btn,

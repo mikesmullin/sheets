@@ -699,13 +699,109 @@ function createApp() {
   },
 
   // ---- cell rendering (Γ, §4.1 default widgets) ----
-  ensureView(slug) {
-    if (this.viewMods[slug] !== undefined || this.viewLoading[slug]) return
+  // Stage views.js load/reload. Multiple signals (tool_result, stages_updated, WS)
+  // are debounced into at most one network fetch; we keep the previous module
+  // painted until a *different* source hash is ready (no empty flash, no redraw storm).
+  async _fetchStageViewsCode(slug) {
+    const url = `/api/stage/${encodeURIComponent(slug)}/views.js?t=${Date.now()}`
+    const res = await fetch(url, { cache: 'no-store' })
+    if (!res.ok) throw new Error(`views ${res.status}`)
+    return res.text()
+  },
+  async _importStageViewsCode(code) {
+    const blob = new Blob([code], { type: 'text/javascript' })
+    const blobUrl = URL.createObjectURL(blob)
+    try {
+      return await import(/* webpackIgnore: true */ blobUrl)
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000)
+    }
+  },
+  _hashStr(s) {
+    // Cheap non-crypto hash for "did views.js change?"
+    let h = 2166136261
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i)
+      h = Math.imul(h, 16777619)
+    }
+    return h >>> 0
+  },
+  ensureView(slug, { force = false } = {}) {
+    if (!slug) return Promise.resolve(null)
+    if (!this._viewPromises) this._viewPromises = {}
+    if (!this._viewGen) this._viewGen = {}
+    if (!this._viewSourceHash) this._viewSourceHash = {}
+    // Cache hit (unless force).
+    if (!force && this.viewMods[slug] !== undefined) return Promise.resolve(this.viewMods[slug])
+    // Share in-flight load (including force — don't stack parallel force fetches).
+    if (this.viewLoading[slug] && this._viewPromises[slug]) return this._viewPromises[slug]
+    const gen = (this._viewGen[slug] ?? 0) + 1
+    this._viewGen[slug] = gen
     this.viewLoading[slug] = true
-    import(`/api/stage/${slug}/views.js?t=${Date.now()}`)
-      .then((m) => { this.viewMods[slug] = m })
-      .catch(() => { this.viewMods[slug] = null })
-      .finally(() => { this.viewLoading[slug] = false })
+    const hadPrevious = this.viewMods[slug] != null
+    const prevHash = this._viewSourceHash[slug]
+    const p = this._fetchStageViewsCode(slug)
+      .then(async (code) => {
+        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        const hash = this._hashStr(code)
+        // Same source as last successful load — keep module, skip import + redraw.
+        if (force && hadPrevious && prevHash === hash) {
+          this._viewSourceHash[slug] = hash
+          return this.viewMods[slug]
+        }
+        const m = await this._importStageViewsCode(code)
+        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        this.viewMods[slug] = m
+        this._viewSourceHash[slug] = hash
+        return { mod: m, changed: !hadPrevious || prevHash !== hash }
+      })
+      .then((result) => {
+        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        if (result && typeof result === 'object' && 'mod' in result) {
+          if (result.changed) this.scheduleViewRedraw()
+          return result.mod
+        }
+        // Unchanged force-reload path returned the old module directly.
+        return result
+      })
+      .catch((err) => {
+        console.warn('ensureView failed', slug, err)
+        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        if (!hadPrevious) this.viewMods[slug] = null
+        return this.viewMods[slug] ?? null
+      })
+      .finally(() => {
+        if (this._viewGen[slug] === gen) {
+          this.viewLoading[slug] = false
+          delete this._viewPromises[slug]
+        }
+      })
+    this._viewPromises[slug] = p
+    return p
+  },
+  scheduleViewRedraw() {
+    if (this._viewRedrawPending) return
+    this._viewRedrawPending = true
+    requestAnimationFrame(() => {
+      this._viewRedrawPending = false
+      this.redrawGrid()
+    })
+  },
+  // Coalesce bursty signals (tool_result + stages_updated + WS) into one trailing reload.
+  // No long cooldown — content-hash still skips redraw when source is unchanged.
+  scheduleStageViewReload(slug, { delay = 80 } = {}) {
+    if (!slug) return
+    if (!this._stageReloadTimers) this._stageReloadTimers = {}
+    clearTimeout(this._stageReloadTimers[slug])
+    this._stageReloadTimers[slug] = setTimeout(() => {
+      delete this._stageReloadTimers[slug]
+      this.reloadStageView(slug)
+    }, delay)
+  },
+  async reloadStageView(slug) {
+    if (!slug) return
+    // In-flight ensureView is shared; force reuses the same promise if loading.
+    await this.ensureView(slug, { force: true })
   },
   cellHtml(row, ci) {
     const col = this.columns[ci]
@@ -1433,15 +1529,34 @@ function createApp() {
       this.stickLogToBottom()
     })
   },
+  magicPromptKey(ci, e) {
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    e.stopPropagation()
+    this.magicSubmit(ci)
+  },
   async magicSubmit(ci) {
     const text = (this.magicInput[ci] ?? '').trim()
     if (!text || !this.canPersist()) return
     let col = this.columns[ci]
     let slug = col?.stage
     if (!slug) {
+      // `ci` is a *visible* column index; server also needs full index when hidden
+      // columns sit in the activity YAML (otherwise it hits the wrong slot).
+      const fullColumn = this.fullIndexFromVisible(ci)
+      if (fullColumn < 0) {
+        this.showToast('could not resolve column for Angela')
+        return
+      }
       const authored = await fetch('/api/stage/from-prompt', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ activity: this.actSlug, column: ci, prompt: text, revision: this.act?.revision ?? 0 }),
+        body: JSON.stringify({
+          activity: this.actSlug,
+          column: ci,
+          fullColumn,
+          prompt: text,
+          revision: this.act?.revision ?? 0,
+        }),
       })
       if (authored.status === 409) {
         this.markDesync()
@@ -2010,11 +2125,12 @@ function createApp() {
   },
   async reloadPersisted(ev) {
     if (ev.resource === 'activity') {
-      return
-    } else if (ev.resource === 'stage') {
-      delete this.viewMods[ev.slug]
-      await this.refreshWindow(false)
+      // Activity YAML changed (columns etc.) — meta refresh is enough; avoid scroll churn.
+      await this.loadMeta(false)
       this.redrawGrid()
+    } else if (ev.resource === 'stage') {
+      // Coalesce with chat-side reloads; one fetch + one paint (no meta thrash).
+      this.scheduleStageViewReload(ev.slug)
     } else if (ev.resource === 'entity') {
       if (ev.source && this.act?.source && ev.source !== this.act.source) return
       await this.refreshWindow(false)
@@ -2476,18 +2592,33 @@ function createApp() {
   startChatClock() {
     this.stopChatClock(false)
     this.chat.startedAt = performance.now()
+    this._chatClockGen = (this._chatClockGen ?? 0) + 1
+    const gen = this._chatClockGen
     const tick = () => {
+      if (gen !== this._chatClockGen) return // stopped or superseded
       this.chat.elapsed = this.formatChatElapsed(performance.now() - this.chat.startedAt)
-      M.redraw()
+      // Direct DOM patch every frame — never full M.redraw (destroys the whole grid).
+      const el = document.querySelector('.chat-elapsed')
+      if (el) {
+        el.textContent = this.chat.elapsed
+        el.hidden = false
+        el.style.display = ''
+      }
+      this.chat.timer = requestAnimationFrame(tick)
     }
-    tick()
-    this.chat.timer = setInterval(tick, 100)
+    this.chat.timer = requestAnimationFrame(tick)
   },
   stopChatClock(freeze = true) {
-    if (this.chat.timer) clearInterval(this.chat.timer)
+    this._chatClockGen = (this._chatClockGen ?? 0) + 1 // invalidate in-flight rAF ticks
+    if (this.chat.timer) {
+      cancelAnimationFrame(this.chat.timer)
+      try { clearInterval(this.chat.timer) } catch { /* legacy */ }
+    }
     this.chat.timer = null
     if (freeze && this.chat.startedAt) this.chat.elapsed = this.formatChatElapsed(performance.now() - this.chat.startedAt)
     if (!freeze) this.chat.elapsed = ''
+    const el = document.querySelector('.chat-elapsed')
+    if (el && this.chat.elapsed) el.textContent = this.chat.elapsed
   },
   updateChatTelemetry(message, patch = {}) {
     if (!message) return
@@ -2557,12 +2688,13 @@ function createApp() {
     const asst = { who: 'angela', body: '', events: [], visible: true, bookmarked: false, telemetry: { startedAt: this.chat.startedAt } }
     this.chat.messages.push(asst)
     this.chat.busy = true
+    const stageForTurn = opts.stage ?? this.focusedStage()
     try {
       const sample = this.rows[0]?.doc ?? null
       const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           content: text, activity: this.actSlug, selection: this.selA1() || null,
-          stage: opts.stage ?? this.focusedStage(), entitySample: sample,
+          stage: stageForTurn, entitySample: sample,
           newSession: opts.newSession ?? false, agent: this.chat.agent, model: this.chat.model,
           thinking: this.chat.thinking, reasoning_effort: this.chat.reasoningEffort,
           allowlist: this.chat.allowlist, allowlistOverridden: this.chat.allowlistOverridden,
@@ -2597,16 +2729,24 @@ function createApp() {
             this.chatApproval(ev.event)
           } else if (ev.type === 'event' && ev.event?.type === 'tool_call') {
             asst.events.push(`⚙ ${ev.event.name ?? 'tool'}`)
+            // Don't reload on tool_call — file may not be fully written yet.
           } else if (ev.type === 'event' && ev.event?.type === 'tool_result') {
             asst.events.push(`${ev.event.ok === false ? '⚠' : '✓'} ${ev.event.name ?? 'tool'}`)
+            if (ev.event.ok !== false) this.maybeReloadStageFromToolEvent(ev.event)
           } else if (ev.type === 'event' && ['gen_info', 'usage'].includes(ev.event?.type)) {
             this.updateChatTelemetry(asst, ev.event)
+          } else if (ev.type === 'stages_updated') {
+            // Authoritative list from server for this turn.
+            for (const slug of (ev.slugs ?? [])) this.scheduleStageViewReload(slug)
           } else if (ev.type === 'done') {
             if (!asst.body) asst.body = ev.text ?? ''
             this.chat.tokensUsed = Number(ev.prompt_tokens ?? this.chat.tokensUsed)
             this.updateChatTelemetry(asst, ev.gen_info ?? { finishReason: this.chat.stopRequested ? 'stop' : 'stop' })
+            // Do not reload on done — tool_result + stages_updated already scheduled
+            // a debounced reload. Extra done reloads caused redraw storms.
           }
-          M.redraw()
+          // Throttle stream redraws — full M.redraw of the grid every NDJSON line is expensive.
+          this.scheduleChatStreamRedraw()
           const el = document.querySelector('.chat .messages'); if (el) el.scrollTop = el.scrollHeight
         }
       }
@@ -2621,6 +2761,37 @@ function createApp() {
       this.speakChatMessage(asst)
       M.redraw()
     }
+  },
+  // ~24fps while Angela streams (full grid redraw is expensive).
+  scheduleChatStreamRedraw() {
+    const minGap = 1000 / 24
+    const now = performance.now()
+    if (this._chatStreamRedrawPending) return
+    const wait = Math.max(0, minGap - (now - (this._chatStreamRedrawAt ?? 0)))
+    this._chatStreamRedrawPending = true
+    const fire = () => {
+      this._chatStreamRedrawPending = false
+      this._chatStreamRedrawAt = performance.now()
+      M.redraw()
+    }
+    if (wait === 0) requestAnimationFrame(fire)
+    else setTimeout(() => requestAnimationFrame(fire), wait)
+  },
+  // Extract stage slug from a chat tool event (file_io__write_file path).
+  stageSlugFromToolPath(p) {
+    if (!p) return null
+    const s = String(p).replace(/\\/g, '/')
+    const m = s.match(/(?:^|\/)(?:\.sheets\/)?stages\/([\w-]+)\.coffee$/i)
+    return m?.[1] ?? null
+  },
+  maybeReloadStageFromToolEvent(ev) {
+    if (!ev) return
+    const name = String(ev.name ?? ev.tool ?? '')
+    if (!/write_file/i.test(name)) return
+    const args = ev.args ?? ev.input ?? {}
+    const slug = this.stageSlugFromToolPath(args.path ?? args.file ?? args.filepath ?? args.file_path)
+      || this.stageSlugFromToolPath(String(ev.text ?? '').match(/(?:\.sheets\/)?stages\/[\w-]+\.coffee/)?.[0])
+    if (slug) this.scheduleStageViewReload(slug)
   },
   chatKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.chatSend() } },
 
@@ -2824,8 +2995,12 @@ function createApp() {
                       @click="openMagicColumn(ci)"></span>
                   </template>
                   <template x-if="magicTitle(ci) === null">
-                    <input placeholder="describe this stage…" :value="magicInput[ci] || ''" @input="magicInput[ci] = $event.target.value"
-                      @keydown="if ($event.key === 'Enter') magicSubmit(ci)">
+                    <div class="magic-prompt">
+                      <input class="magic-prompt-input" type="text" placeholder="describe this stage…"
+                        :value="magicInput[ci] || ''" @input="magicInput[ci] = $event.target.value"
+                        @keydown="magicPromptKey(ci, $event)">
+                      <button type="button" class="angela-send" @click.stop="magicSubmit(ci)" title="send to Angela">✨</button>
+                    </div>
                   </template>
                   <span class="actions">
                     <button class="col-move" title="move column left" x-show="ci > 0" @click.stop="moveColumn(ci, -1)">‹</button>
@@ -2835,7 +3010,6 @@ function createApp() {
                       title="sort / filter column" @click.stop="openFilterMenu(ci, $event)">
                       <i class="ph-bold ph-funnel" aria-hidden="true"></i>
                     </button>
-                    <button class="angela-send" x-show="!col.stage && magicInput[ci]" @click="magicSubmit(ci)" title="send to Angela">✨</button>
                   </span>
                   <div class="col-filter-menu" x-show="filterMenu && filterMenu.ci === ci" @click.stop>
                     <div class="cfm-row sort-row">

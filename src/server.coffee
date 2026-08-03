@@ -82,7 +82,6 @@ export startServer = (opts = {}) ->
   stages = new Stages ws
   engine = new Engine ws, store, stages
   engine.setConcurrency ws.concurrency
-  chat = createChatApi ws, { stages, activities, store, engine }
   sockets = new Set()
   hmrClients = new Set()
   watchers = []
@@ -105,11 +104,26 @@ export startServer = (opts = {}) ->
       catch then null
     console.log "[hmr] #{rel} → #{n} client(s)"
     null
+
   persisted = (resource, data = {}) ->
     ev = { type: 'persisted', resource }
     ev[key] = value for key, value of data
     broadcast ev
     null
+
+  # Shared by fs.watch + Angela file_io writes (chat) so SPA always reloads stage views.
+  notifyStageWritten = (slug) ->
+    return unless slug
+    stages.invalidate slug
+    console.log "sheets: stage updated #{slug}"
+    persisted 'stage', { slug }
+    null
+
+  chat = createChatApi ws, {
+    stages, activities, store, engine
+    onStageWritten: notifyStageWritten
+  }
+
   engine.on 'event', (ev) ->
     if ev.type is 'entity'
       persisted 'entity', { source: ev.source, id: ev.id }
@@ -130,11 +144,13 @@ export startServer = (opts = {}) ->
     debounces.set key, setTimeout(fn, ms)
 
   watchSafe ws.stagesDir, (event, fname) ->
-    return unless fname?.endsWith '.coffee'
-    slug = fname.replace /\.coffee$/, ''
-    debounce "stage:#{slug}", 150, ->
-      stages.invalidate slug
-      persisted 'stage', { slug }
+    # Editors / tools that write outside chat still land here.
+    return unless fname?
+    base = path.basename String(fname)
+    return unless base.endsWith '.coffee'
+    slug = base.replace /\.coffee$/, ''
+    return unless slug
+    debounce "stage:#{slug}", 120, -> notifyStageWritten slug
 
   watchSafe ws.activitiesDir, (event, fname) ->
     return unless fname?.match /\.ya?ml$/
@@ -167,7 +183,7 @@ export startServer = (opts = {}) ->
   # load every activity source into the PGLite mirror
   loadAll = ->
     dirs = new Set(a.source for a in activities.list())
-    dirs.add ws.db
+    dirs.add d for d in (ws.dbs ? [ws.db])
     for dir from dirs when fs.existsSync dir
       n = await store.loadSource dir
       watchSource dir
@@ -338,7 +354,7 @@ export startServer = (opts = {}) ->
     if p is '/api/meta'
       acts = activities.list()
       return json {
-        root: ws.root, db: ws.db, port: ws.port
+        root: ws.root, db: ws.db, dbs: (ws.dbs ? [ws.db]), port: ws.port
         model: ws.model, chat: chat.enabled()
         activities: ({ slug: a.slug, title: a.title, source: a.source, columns: a.columns, componentLocks: a.componentLocks, revision: a.revision } for a in acts)
       }
@@ -632,10 +648,21 @@ export startServer = (opts = {}) ->
       a = resolveActivity body.activity
       if body.revision? and Number(body.revision) isnt Number(a.revision ? 0)
         return json { error: 'activity revision conflict', revision: a.revision }, 409
-      ci = Number body.column
-      fi = fullIndexFromVisible a.columns, ci
-      col = if fi >= 0 then a.columns[fi] else null
-      return json { error: 'select an empty column first' }, 400 unless Number.isInteger(ci) and col? and not col.stage? and not col.field?
+      # Prefer fullColumn (index into activity YAML including hidden). Fall back to
+      # mapping visible `column` → full index — required when hidden field columns exist.
+      fi = if body.fullColumn? and Number.isFinite(Number body.fullColumn)
+        Math.trunc Number body.fullColumn
+      else
+        fullIndexFromVisible a.columns, Number(body.column)
+      col = if fi >= 0 and fi < (a.columns?.length ? 0) then a.columns[fi] else null
+      isEmptyCol = (c) -> c? and not c.stage and not c.field
+      unless isEmptyCol col
+        return json {
+          error: if col?.stage or col?.field
+            "column is not empty (has #{if col.stage then 'stage' else 'field'})"
+          else
+            'select an empty column first'
+        }, 400
       slug = promptStageSlug prompt, stages
       activities.update a.slug, (doc) ->
         doc.columns ?= []
@@ -660,7 +687,7 @@ export startServer = (opts = {}) ->
       if req.method is 'PUT'
         body = await req.json()
         stages.write slug, String(body.source ? '')
-        persisted 'stage', { slug }
+        notifyStageWritten slug
         return json { ok: true }
 
     if p is '/api/run' and req.method is 'POST'
@@ -807,6 +834,9 @@ export startServer = (opts = {}) ->
   process.on 'SIGINT', -> cleanup(); process.exit 0
   process.on 'SIGTERM', -> cleanup(); process.exit 0
 
-  console.log "sheets serving #{ws.root} (db: #{ws.db}) on http://localhost:#{ws.port}"
+  dbLabel = if (ws.dbs ? []).length > 1 then "dbs: #{ws.dbs.join ', '}" else "db: #{ws.db}"
+  console.log "sheets serving #{ws.root} (#{dbLabel}) on http://localhost:#{ws.port}"
+  for a in activities.list()
+    console.log "  tab #{a.slug}  ←  #{a.source}"
   console.log "sheets HMR ws://localhost:#{ws.port}/__m_hmr (watching public/)"
   { server, ws, store, engine, stages, activities, stop: -> cleanup(); server.stop(true) }

@@ -1,8 +1,23 @@
 # Workspace resolution. Config (.sheets/) always lives in the launch cwd; --db (and each
 # activity's rows.source) may point at any entity database on disk without polluting it.
+# Multiple --db flags are supported: each path is scanned for activities (or becomes one tab).
 import fs from 'node:fs'
 import path from 'node:path'
 import yaml from 'js-yaml'
+
+# Normalize one or many --db values to an absolute path list (deduped, order preserved).
+export resolveDbPaths = (root, dbOpt, configDb) ->
+  raw = dbOpt ? configDb ? 'db'
+  list = if Array.isArray raw then raw else [raw]
+  out = []
+  seen = new Set()
+  for item in list when item? and String(item).trim() isnt ''
+    abs = path.resolve root, String(item).trim()
+    continue if seen.has abs
+    seen.add abs
+    out.push abs
+  out.push path.resolve(root, 'db') unless out.length
+  out
 
 export resolveWorkspace = (opts = {}) ->
   root = path.resolve opts.root ? process.cwd()
@@ -11,9 +26,10 @@ export resolveWorkspace = (opts = {}) ->
   config = {}
   if fs.existsSync cfgPath
     config = yaml.load(fs.readFileSync cfgPath, 'utf8') ? {}
-  db = path.resolve root, (opts.db ? config.db ? 'db')
+  dbs = resolveDbPaths root, opts.db, config.db
+  db = dbs[0]
   {
-    root, sheetsDir, cfgPath, config, db
+    root, sheetsDir, cfgPath, config, db, dbs
     activitiesDir: path.join sheetsDir, 'activities'
     stagesDir: path.join sheetsDir, 'stages'
     runsDir: path.join sheetsDir, 'runs'
