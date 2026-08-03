@@ -11,6 +11,14 @@ const MAX_ROW_HEIGHT = 480
 const DEFAULT_COL_WIDTH = 180
 const MIN_COL_WIDTH = 60
 const MAX_COL_WIDTH = 960
+// Virtual scroll (Option A + GROK1): big overscan, page cache, rAF-only updates.
+// Server caps /api/entities limit at 500 — at/under that we full-load once and use
+// native scroll (no mid-fling window commits). Above that, edge-triggered windows.
+const V_OVERSCAN = 32          // rows above/below viewport (fling headroom)
+const V_PAGE = 48              // cache granularity
+const V_PAGE_CACHE_MAX = 24    // max pages retained (~1k rows)
+const V_FULL_LOAD_MAX = 500    // match server limit; paint all rows, never shift window
+const V_SCROLL_IDLE_MS = 160   // after this quiet period, flush deferred redraws
 const normalizeRowHeight = (height) => {
   const n = Math.round(Number(height))
   if (!Number.isFinite(n)) return ROWH
@@ -32,6 +40,8 @@ function createApp() {
   return {
   // ---- state ----
   meta: null, actSlug: null, total: 0, rows: [], winStart: 0, fields: [], fieldTree: [], stageTree: [], componentLocks: {},
+  // Virtual window: bodyOffsetY positions rendered rows via transform; totalBodyH is the rock-solid spacer.
+  bodyOffsetY: 0, totalBodyH: 0,
   sel: { ranges: [], active: null, anchor: null },
   cellStates: {}, stagePending: {}, viewMods: {}, viewLoading: {},
   wsConnected: false,
@@ -106,12 +116,21 @@ function createApp() {
   },
 
   async init() {
-    // Full m-js redraw rebuilds DOM and drops scrollTop; always snapshot/restore.
+    // Full m-js redraw destroys #app (including .gridwrap) and kills scroll momentum.
+    // Wrap redraw to (1) restore scrollTop and (2) defer redraws while the user is
+    // actively flinging the grid — that destroy/recreate cycle is the main recoil.
     if (!M._sheetsScrollWrap) {
       M._sheetsScrollWrap = true
       const rawRedraw = M.redraw.bind(M)
       const self = this
-      M.redraw = () => self.preserveUiScroll(() => rawRedraw())
+      M.redraw = () => {
+        if (self._isGridScrollHot() && !self._preservingScroll && !self._forceRedraw) {
+          self._pendingRedraw = true
+          self._scheduleScrollIdleFlush()
+          return
+        }
+        self.preserveUiScroll(() => rawRedraw())
+      }
     }
     this.loadChatPrefs()
     await this.loadMeta()
@@ -119,6 +138,45 @@ function createApp() {
     window.addEventListener('keydown', (e) => this.globalKey(e))
     window.addEventListener('hashchange', () => this.route())
     this.route()
+  },
+  // True while the user is mid-gesture on the grid (wheel/trackpad/thumb).
+  _isGridScrollHot() {
+    const at = this._gridUserScrollAt ?? 0
+    return at > 0 && (performance.now() - at) < V_SCROLL_IDLE_MS
+  },
+  _scheduleScrollIdleFlush() {
+    if (this._scrollIdleTimer) clearTimeout(this._scrollIdleTimer)
+    this._scrollIdleTimer = setTimeout(() => {
+      this._scrollIdleTimer = 0
+      this._flushScrollIdle()
+    }, V_SCROLL_IDLE_MS)
+  },
+  _flushScrollIdle() {
+    if (this._isGridScrollHot()) {
+      this._scheduleScrollIdleFlush()
+      return
+    }
+    // Apply deferred virtual-window commit first (state only), then one redraw.
+    if (this._pendingWindow && this._pendingAssembled) {
+      this.winStart = this._pendingFirst ?? 0
+      this.rows = this._pendingAssembled
+      this.bodyOffsetY = this.winStart * ROWH
+      this._pendingAssembled = null
+      this._pendingFirst = null
+      this._pendingWindow = false
+      this._pendingRedraw = true
+    }
+    const needRedraw = this._pendingRedraw
+    const needWindow = this._scrollDirty
+    this._pendingRedraw = false
+    this._scrollDirty = false
+    if (needWindow && !(this._fullLoaded && this._canFullLoad())) {
+      this.ensureWindow({ reset: false })
+    }
+    if (needRedraw) {
+      this._forceRedraw = true
+      try { M.redraw() } finally { this._forceRedraw = false }
+    }
   },
 
   route() {
@@ -365,30 +423,401 @@ function createApp() {
     }
     return params
   },
-  async refreshWindow(reset) {
-    const el = document.querySelector('.gridwrap')
-    const scrollTop = reset ? 0 : (el?.scrollTop ?? 0)
-    const request = (this._windowRequest ?? 0) + 1
-    this._windowRequest = request
-    const visible = Math.ceil((el?.clientHeight ?? 600) / ROWH) + 20
-    const start = Math.max(0, Math.floor(scrollTop / ROWH) - 10)
-    const params = await this.entityParams(start, visible)
-    const data = await (await fetch(`/api/entities?${params}`)).json()
-    if (request !== this._windowRequest) return
-    this.total = data.total
-    this.rows = data.rows
-    this.winStart = data.offset
-    if (!reset) requestAnimationFrame(() => {
-      const grid = document.querySelector('.gridwrap')
-      if (grid) grid.scrollTop = scrollTop
+  // ---- virtual scroll window (Option A: page cache + predictive fetch) ----
+  // GROK1_SCROLL: fixed ROWH math, big velocity-biased overscan, rAF-only heavy
+  // work, rock-solid totalBodyH spacer, GPU translate3d on tbody (no top/left).
+  // Server caps /api/entities limit at 500 — keep fetches page-aligned under that.
+  _windowCacheKey() {
+    return JSON.stringify({
+      a: this.actSlug ?? '',
+      q: this.search ?? '',
+      sort: this.sort ?? null,
+      f: this.colFilters ?? {},
     })
   },
-  onScroll() {
-    clearTimeout(this._scrollT)
-    this._scrollT = setTimeout(() => this.refreshWindow(false), 60)
+  _invalidateWindowCache() {
+    this._pageCache = new Map()
+    this._pageInflight = new Map() // pageIndex -> Promise
+    this._windowKey = this._windowCacheKey()
+    this._windowGen = (this._windowGen ?? 0) + 1
+    this._totalKnown = false
+    this._fullLoaded = false
   },
+  // Small sheets: one fetch, paint every row, native scroll only (no window shifts).
+  _canFullLoad() {
+    return this._totalKnown && this.total > 0 && this.total <= V_FULL_LOAD_MAX
+  },
+  _getPage(pageIndex) {
+    if (!this._pageCache) this._pageCache = new Map()
+    const hit = this._pageCache.get(pageIndex)
+    if (!hit || hit.key !== this._windowKey) return null
+    return hit
+  },
+  _touchPage(pageIndex) {
+    // Move key to end so Map order approximates LRU.
+    if (!this._pageCache?.has(pageIndex)) return
+    const hit = this._pageCache.get(pageIndex)
+    this._pageCache.delete(pageIndex)
+    this._pageCache.set(pageIndex, hit)
+  },
+  _putPages(offset, rows, total, key) {
+    if (!this._pageCache) this._pageCache = new Map()
+    if (key != null && key !== this._windowKey) return // stale response after invalidate
+    const storeKey = this._windowKey ?? this._windowCacheKey()
+    // Split into page-aligned chunks (fetch offsets are always page-aligned).
+    for (let i = 0; i < rows.length; ) {
+      const abs = offset + i
+      const pageIndex = Math.floor(abs / V_PAGE)
+      const pageStart = pageIndex * V_PAGE
+      const skip = abs - pageStart // 0 when aligned
+      const want = V_PAGE - skip
+      const slice = rows.slice(i, i + want)
+      if (slice.length === 0) break
+      // Only store when we filled from the page start (or this is a short final page).
+      if (skip === 0) {
+        this._pageCache.set(pageIndex, { key: storeKey, rows: slice, total, pageStart })
+      }
+      i += slice.length
+    }
+    // Empty dataset: still record page 0 so we don't refetch forever (total can be 0).
+    if (offset === 0 && rows.length === 0) {
+      this._pageCache.set(0, { key: storeKey, rows: [], total: total ?? 0, pageStart: 0 })
+    }
+    while (this._pageCache.size > V_PAGE_CACHE_MAX) {
+      const oldest = this._pageCache.keys().next().value
+      this._pageCache.delete(oldest)
+    }
+    if (typeof total === 'number' && Number.isFinite(total)) {
+      this.total = total
+      this._totalKnown = true
+      // Rock-solid spacer: only changes when server total changes, never mid-scroll.
+      this.totalBodyH = Math.max(0, total * ROWH)
+    }
+  },
+  _assembleRows(start, count) {
+    if (count <= 0) return []
+    const out = []
+    let at = start
+    const end = start + count
+    while (at < end) {
+      if (this._totalKnown && at >= this.total) break
+      const pageIndex = Math.floor(at / V_PAGE)
+      const page = this._getPage(pageIndex)
+      if (!page) return null
+      this._touchPage(pageIndex)
+      const pageStart = pageIndex * V_PAGE
+      const idx = at - pageStart
+      if (idx < 0 || idx >= page.rows.length) {
+        if (this._totalKnown && at >= this.total) break
+        // Short last page: stop cleanly when we've exhausted known rows.
+        if (page.rows.length < V_PAGE && idx >= page.rows.length) break
+        return null
+      }
+      const take = Math.min(page.rows.length - idx, end - at)
+      for (let i = 0; i < take; i++) out.push(page.rows[idx + i])
+      at += take
+      if (page.rows.length < V_PAGE) break
+    }
+    return out
+  },
+  _pageRangeFor(start, count) {
+    const end = start + Math.max(count, 1) - 1
+    const a = Math.floor(start / V_PAGE)
+    const b = Math.floor(Math.max(start, end) / V_PAGE)
+    return [a, b]
+  },
+  // Fetch [pageFrom, pageTo] inclusive. Shares in-flight promises so concurrent
+  // ensureWindow/prefetch never race-drop each other's responses.
+  async _fetchPageRange(pageFrom, pageTo) {
+    if (!this._pageInflight) this._pageInflight = new Map()
+    if (pageTo < pageFrom) return
+    // Cap span to server limit (500 rows).
+    const maxPages = Math.max(1, Math.floor(500 / V_PAGE))
+    if (pageTo - pageFrom + 1 > maxPages) pageTo = pageFrom + maxPages - 1
+
+    const waiters = []
+    let runStart = null
+    const kickRun = (from, to) => {
+      // One network request for a contiguous hole; every page in the hole shares the promise.
+      const keyAtStart = this._windowKey
+      const genAtStart = this._windowGen ?? 0
+      const pages = []
+      for (let p = from; p <= to; p++) pages.push(p)
+      const offset = from * V_PAGE
+      const limit = (to - from + 1) * V_PAGE
+      const promise = (async () => {
+        try {
+          const params = await this.entityParams(offset, limit)
+          const data = await (await fetch(`/api/entities?${params}`)).json()
+          if ((this._windowGen ?? 0) !== genAtStart || this._windowKey !== keyAtStart) return
+          this._putPages(data.offset ?? offset, data.rows ?? [], data.total ?? 0, keyAtStart)
+        } catch (err) {
+          console.error('window fetch failed', err)
+        } finally {
+          for (const p of pages) {
+            if (this._pageInflight.get(p) === promise) this._pageInflight.delete(p)
+          }
+        }
+      })()
+      for (const p of pages) this._pageInflight.set(p, promise)
+      waiters.push(promise)
+    }
+
+    for (let p = pageFrom; p <= pageTo; p++) {
+      if (this._getPage(p)) {
+        if (runStart != null) { kickRun(runStart, p - 1); runStart = null }
+        continue
+      }
+      const inflight = this._pageInflight.get(p)
+      if (inflight) {
+        if (runStart != null) { kickRun(runStart, p - 1); runStart = null }
+        waiters.push(inflight)
+        continue
+      }
+      if (runStart == null) runStart = p
+    }
+    if (runStart != null) kickRun(runStart, pageTo)
+    if (waiters.length) await Promise.all(waiters)
+  },
+  _prefetchPage(pageIndex) {
+    if (pageIndex < 0) return
+    if (this._totalKnown && pageIndex * V_PAGE >= this.total) return
+    if (this._getPage(pageIndex)) return
+    // Fire-and-forget; no redraw on prefetch alone.
+    this._fetchPageRange(pageIndex, pageIndex)
+  },
+  _visibleRange() {
+    const el = document.querySelector('.gridwrap')
+    // Prefer live DOM scrollTop; _scrollTop can lag one event behind a fling.
+    const live = el?.scrollTop
+    const scrollTop = (live != null && !this._programmaticGridScroll)
+      ? live
+      : (this._scrollTop ?? live ?? 0)
+    if (live != null && !this._programmaticGridScroll) this._scrollTop = live
+    const vh = el?.clientHeight ?? 600
+    const viewportRows = Math.max(1, Math.ceil(vh / ROWH))
+    let overTop = V_OVERSCAN
+    let overBot = V_OVERSCAN
+    const vel = this._scrollVel ?? 0
+    // Bias overscan in fling direction (GROK1 #2).
+    if (vel > 1.2) overBot = V_OVERSCAN * 2
+    else if (vel < -1.2) overTop = V_OVERSCAN * 2
+    const visibleFirst = Math.max(0, Math.floor(scrollTop / ROWH))
+    const visibleLast = visibleFirst + viewportRows
+    const first = Math.max(0, visibleFirst - overTop)
+    let count = viewportRows + overTop + overBot
+    if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
+    return { first, count, vel, scrollTop, visibleFirst, visibleLast, viewportRows }
+  },
+  // True when the currently painted window still covers the viewport + a safety margin.
+  // Avoids full M.redraw on every row of scroll (major recoil source).
+  _windowCoversView(visibleFirst, visibleLast) {
+    if (!this.rows?.length) return false
+    // Keep a cushion so we refresh before the user hits empty rows.
+    const margin = Math.max(4, Math.min(12, V_OVERSCAN >> 2))
+    const lo = this.winStart + margin
+    const hi = this.winStart + this.rows.length - margin
+    if (hi <= lo) return false // painted range too small — always refresh
+    return visibleFirst >= lo && visibleLast <= hi
+  },
+  _commitWindow(first, assembled, { force = false } = {}) {
+    const same =
+      first === this.winStart &&
+      assembled.length === this.rows.length &&
+      (assembled.length === 0 || (
+        assembled[0]?.id === this.rows[0]?.id &&
+        assembled[assembled.length - 1]?.id === this.rows[this.rows.length - 1]?.id
+      ))
+    if (same) return false
+    // During an active fling, never rebuild the DOM — that kills momentum (recoil).
+    // Queue a commit for scroll-idle unless force (initial load / filter reset).
+    if (!force && this._isGridScrollHot()) {
+      this._pendingWindow = true
+      this._pendingFirst = first
+      this._pendingAssembled = assembled
+      this._scheduleScrollIdleFlush()
+      return false
+    }
+    this.winStart = first
+    this.rows = assembled
+    this.bodyOffsetY = first * ROWH
+    if (!this.totalBodyH && this.total) this.totalBodyH = this.total * ROWH
+    this._gridWindowCommit = true
+    this._forceRedraw = true
+    try { M.redraw() } finally {
+      this._forceRedraw = false
+      this._gridWindowCommit = false
+    }
+    return true
+  },
+  async ensureWindow({ reset = false } = {}) {
+    // Coalesce concurrent callers (scroll rAF + refreshWindow + post-fetch).
+    if (this._ensureRunning) {
+      this._ensureQueued = true
+      if (reset) this._ensureReset = true
+      return this._ensurePromise
+    }
+    this._ensureRunning = true
+    this._ensurePromise = (async () => {
+      try {
+        let passes = 0
+        do {
+          if (++passes > 12) break // safety: never spin on fetch holes
+          this._ensureQueued = false
+          this._scrollDirty = false
+          const doReset = reset || this._ensureReset
+          this._ensureReset = false
+          reset = false
+
+          const el = document.querySelector('.gridwrap')
+          if (doReset) {
+            this._invalidateWindowCache()
+            if (el) {
+              this._programmaticGridScroll = true
+              el.scrollTop = 0
+              this._programmaticGridScroll = false
+            }
+            this._scrollTop = 0
+            this._scrollVel = 0
+            this._lastScrollTop = 0
+          }
+          const key = this._windowCacheKey()
+          if (key !== this._windowKey) this._invalidateWindowCache()
+
+          // Bootstrap total if unknown.
+          if (!this._totalKnown) {
+            await this._fetchPageRange(0, 0)
+          }
+
+          // ---- Full-load path (≤500 rows): paint everything once, native scroll ----
+          if (this._canFullLoad()) {
+            if (!this._fullLoaded || doReset) {
+              const lastPage = Math.max(0, Math.ceil(this.total / V_PAGE) - 1)
+              await this._fetchPageRange(0, lastPage)
+              const assembled = this._assembleRows(0, this.total)
+              if (assembled && assembled.length === this.total) {
+                this._fullLoaded = true
+                this._commitWindow(0, assembled, { force: true })
+              } else if (assembled) {
+                // Partial (shouldn't happen for total≤500) — still paint what we have.
+                this._fullLoaded = assembled.length >= this.total
+                this._commitWindow(0, assembled, { force: true })
+              }
+            }
+            break // no mid-scroll window work
+          }
+          this._fullLoaded = false
+
+          // ---- Virtual path (total > 500) ----
+          let { first, count, vel, visibleFirst, visibleLast } = this._visibleRange()
+
+          // During hot scroll: only act if viewport is about to run out of rows.
+          if (!doReset && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) {
+            break
+          }
+
+          if (!doReset && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
+            const nearTop = visibleFirst < this.winStart + V_OVERSCAN
+            const nearBot = visibleLast > this.winStart + this.rows.length - V_OVERSCAN
+            if (nearBot) this._prefetchPage(Math.floor((this.winStart + this.rows.length) / V_PAGE) + 1)
+            if (nearTop) this._prefetchPage(Math.floor(this.winStart / V_PAGE) - 1)
+            break
+          }
+
+          let [pageLo, pageHi] = this._pageRangeFor(first, count || V_PAGE)
+          await this._fetchPageRange(pageLo, pageHi)
+
+          ;({ first, count, vel, visibleFirst, visibleLast } = this._visibleRange())
+          if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
+
+          if (!doReset && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
+            break
+          }
+
+          const [needLo, needHi] = this._pageRangeFor(first, count || V_PAGE)
+          let needFetch = false
+          for (let p = needLo; p <= needHi; p++) {
+            if (this._totalKnown && p * V_PAGE >= this.total) continue
+            if (!this._getPage(p)) { needFetch = true; break }
+          }
+          if (needFetch) {
+            await this._fetchPageRange(needLo, needHi)
+            ;({ first, count, vel } = this._visibleRange())
+            if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
+          }
+
+          const assembled = this._assembleRows(first, count)
+          if (assembled) {
+            // force only on reset; otherwise defer commit if mid-fling
+            this._commitWindow(first, assembled, { force: doReset })
+            const [lo, hi] = this._pageRangeFor(first, Math.max(count, 1))
+            if (vel >= 0) this._prefetchPage(hi + 1)
+            else this._prefetchPage(lo - 1)
+          }
+        } while (this._ensureQueued || this._scrollDirty)
+      } finally {
+        this._ensureRunning = false
+        this._ensurePromise = null
+      }
+    })()
+    return this._ensurePromise
+  },
+  // Public API used across the app (filter/search/play refresh).
+  async refreshWindow(reset) {
+    await this.ensureWindow({ reset: !!reset })
+  },
+  onScroll(e) {
+    // Ignore only our own programmatic restores (setting scrollTop after M.redraw).
+    if (this._programmaticGridScroll) return
+    const el = e?.target ?? document.querySelector('.gridwrap')
+    if (!el) return
+    const now = performance.now()
+    const top = el.scrollTop
+    if (this._lastScrollT != null) {
+      const dt = Math.max(1, now - this._lastScrollT)
+      this._scrollVel = (top - (this._lastScrollTop ?? top)) / dt // px/ms
+    }
+    this._lastScrollTop = top
+    this._lastScrollT = now
+    this._scrollTop = top
+    this._scrollLeft = el.scrollLeft
+    this._gridUserScrollAt = now
+    // Keep idle-flush armed so deferred redraws land after the fling.
+    this._scheduleScrollIdleFlush()
+
+    // Full-load sheets: native scroll only — never ensureWindow/redraw on scroll.
+    if (this._fullLoaded && this._canFullLoad()) return
+
+    if (this._preservingScroll) {
+      this._scrollDirty = true
+      return
+    }
+    this._scrollDirty = true
+    if (!this._scrollRaf) {
+      this._scrollRaf = requestAnimationFrame(() => {
+        this._scrollRaf = 0
+        if (!this._scrollDirty) return
+        // Hot fling: defer window work to idle (unless buffer about to empty —
+        // ensureWindow itself no-ops when still covered).
+        this.ensureWindow({ reset: false })
+      })
+    }
+  },
+  // Spacers: total height = totalBodyH stays fixed while top/bot pads rebalance.
+  // Full-load natural rows: winStart=0 and rows.length===total → pads are 0; native height wins.
   get topPad() { return this.winStart * ROWH },
-  get bottomPad() { return Math.max(0, (this.total - this.winStart - this.rows.length) * ROWH) },
+  get bottomPad() {
+    const totalH = this.totalBodyH || ((this.total || 0) * ROWH)
+    return Math.max(0, totalH - this.topPad - this.rows.length * ROWH)
+  },
+  get bodyTransform() {
+    // GPU layer promotion (GROK1 #3). Geometry comes from top/bot spacers, not translate Y.
+    return 'translate3d(0,0,0)'
+  },
+  // Natural variable heights when full-loaded; fixed ROWH only while virtualizing.
+  get rowHeightMode() {
+    return (this._fullLoaded && this._canFullLoad()) ? 'rows-natural' : 'rows-fixed'
+  },
 
   // ---- cell rendering (Γ, §4.1 default widgets) ----
   ensureView(slug) {
@@ -537,6 +966,7 @@ function createApp() {
     window.addEventListener('pointerup', up)
     window.addEventListener('pointercancel', up)
   },
+  // User-resized height only; null means "natural / content-driven".
   rowHeightPx(row) {
     if (!row?.id) return null
     const h = this.rowHeights[row.id]
@@ -544,10 +974,29 @@ function createApp() {
   },
   rowStyle(row) {
     const h = this.rowHeightPx(row)
-    return h == null ? '' : `--row-h:${h}px;height:${h}px`
+    if (h != null) return `--row-h:${h}px;height:${h}px`
+    // Virtual window needs a fixed height so spacers stay accurate.
+    if (this.rowHeightMode === 'rows-fixed') return `--row-h:${ROWH}px;height:${ROWH}px`
+    return ''
   },
   rowClass(row) {
-    return this.rowHeightPx(row) == null ? '' : 'row-h-fixed'
+    if (this.rowHeightPx(row) != null) return 'row-h-fixed'
+    if (this.rowHeightMode === 'rows-fixed') return 'row-h-fixed'
+    return ''
+  },
+  // Sticky thead = column letters + magic filter row.
+  gridHeaderH() {
+    const thead = document.querySelector('.gridwrap thead')
+    if (thead) {
+      const h = thead.getBoundingClientRect().height
+      if (h > 0) return h
+    }
+    return ROWH + 30 // --rowh + --magich fallback
+  },
+  pageRowCount() {
+    const el = document.querySelector('.gridwrap')
+    const bodyH = Math.max(ROWH, (el?.clientHeight ?? 600) - this.gridHeaderH())
+    return Math.max(1, Math.floor(bodyH / ROWH))
   },
   startRowResize(i, e) {
     if (e.button != null && e.button !== 0) return
@@ -556,7 +1005,8 @@ function createApp() {
     const row = this.rows[i]
     if (!row?.id) return
     const tr = e.currentTarget?.closest?.('tr') ?? document.querySelector(`tr[data-row-id="${CSS.escape(row.id)}"]`)
-    const startH = this.rowHeightPx(row) ?? Math.round(tr?.getBoundingClientRect().height || ROWH)
+    // Prefer live measured height (natural tall rows, or current fixed height).
+    const startH = Math.round(tr?.getBoundingClientRect().height || this.rowHeightPx(row) || ROWH)
     const startY = e.clientY
     const previousCursor = document.body.style.cursor
     const previousSelect = document.body.style.userSelect
@@ -646,6 +1096,22 @@ function createApp() {
     if (this.editing || this.focus) return
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
     const a = this.sel.active
+    const lastR = Math.max(0, (this.total || 1) - 1)
+    const lastC = Math.max(0, this.columns.length - 1)
+    const moveSelTo = (r, c, { shift } = {}) => {
+      r = Math.max(0, Math.min(lastR, r))
+      c = Math.max(0, Math.min(lastC, c))
+      if (shift && this.sel.anchor) {
+        const an = this.sel.anchor
+        this.sel.ranges[Math.max(0, this.sel.ranges.length - 1)] =
+          { r0: Math.min(an.r, r), c0: Math.min(an.c, c), r1: Math.max(an.r, r), c1: Math.max(an.c, c) }
+      } else {
+        this.sel.ranges = [{ r0: r, c0: c, r1: r, c1: c }]
+        this.sel.anchor = { r, c }
+      }
+      this.sel.active = { r, c }
+      return r
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
       e.preventDefault()
       this.copySelection()
@@ -658,7 +1124,43 @@ function createApp() {
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
       e.preventDefault()
-      this.sel.ranges = [{ r0: 0, c0: 0, r1: Math.max(0, this.total - 1), c1: Math.max(0, this.columns.length - 1) }]
+      this.sel.ranges = [{ r0: 0, c0: 0, r1: lastR, c1: lastC }]
+      return
+    }
+    // Ctrl/Cmd+Home → first row; Ctrl/Cmd+End → last row (scroll + selection).
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Home') {
+      e.preventDefault()
+      const c = a?.c ?? 0
+      if (a || this.sel.ranges.length) moveSelTo(0, c, { shift: e.shiftKey })
+      this.scrollToRow(0, { align: 'start' })
+      M.redraw()
+      return
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'End') {
+      e.preventDefault()
+      const c = a?.c ?? 0
+      if (a || this.sel.ranges.length) moveSelTo(lastR, c, { shift: e.shiftKey })
+      this.scrollToRow(lastR, { align: 'end' })
+      M.redraw()
+      return
+    }
+    // PageUp / PageDown: move by a viewport of body rows (and scroll).
+    if (e.key === 'PageUp' || e.key === 'PageDown') {
+      e.preventDefault()
+      const dir = e.key === 'PageDown' ? 1 : -1
+      const page = this.pageRowCount()
+      if (a) {
+        const r = moveSelTo(a.r + dir * page, a.c, { shift: e.shiftKey })
+        this.scrollToRow(r, { align: dir > 0 ? 'end' : 'start' })
+        M.redraw()
+      } else {
+        const el = document.querySelector('.gridwrap')
+        if (el) {
+          el.scrollTop = Math.max(0, el.scrollTop + dir * page * ROWH)
+          this._scrollTop = el.scrollTop
+          this.onScroll({ target: el })
+        }
+      }
       return
     }
     if (!a) return
@@ -667,18 +1169,9 @@ function createApp() {
       e.preventDefault()
       let [dr, dc] = move
       if (e.ctrlKey || e.metaKey) { dr *= this.total; dc *= this.columns.length } // jump to edge
-      const r = Math.max(0, Math.min(this.total - 1, a.r + dr))
-      const c = Math.max(0, Math.min(this.columns.length - 1, a.c + dc))
-      if (e.shiftKey && this.sel.anchor) {
-        const an = this.sel.anchor
-        this.sel.ranges[Math.max(0, this.sel.ranges.length - 1)] =
-          { r0: Math.min(an.r, r), c0: Math.min(an.c, c), r1: Math.max(an.r, r), c1: Math.max(an.c, c) }
-      } else {
-        this.sel.ranges = [{ r0: r, c0: c, r1: r, c1: c }]
-        this.sel.anchor = { r, c }
-      }
-      this.sel.active = { r, c }
+      const r = moveSelTo(a.r + dr, a.c + dc, { shift: e.shiftKey })
       this.scrollToRow(r)
+      return
     }
     if (e.key === 'Enter') { e.preventDefault(); this.startEditActive() }
     else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
@@ -686,13 +1179,63 @@ function createApp() {
       this.startEditActive(e.key)
     }
   },
-  scrollToRow(r) {
+  // align: 'start' | 'end' | 'nearest' (default).
+  // Prefer measuring the painted <tr> (correct for variable heights); fall back to ROWH math.
+  scrollToRow(r, { align = 'nearest' } = {}) {
     const el = document.querySelector('.gridwrap')
     if (!el) return
-    const y = r * ROWH
-    if (y < el.scrollTop) el.scrollTop = y
-    else if (y + ROWH > el.scrollTop + el.clientHeight - ROWH * 3) el.scrollTop = y - el.clientHeight + ROWH * 4
-    this.onScroll()
+    const lastR = Math.max(0, (this.total || 1) - 1)
+    r = Math.max(0, Math.min(lastR, r))
+    const headerH = this.gridHeaderH()
+    const local = r - this.winStart
+    const tr = (local >= 0 && local < this.rows.length)
+      ? el.querySelector(`tr.virtual-row[data-row-id="${CSS.escape(this.rows[local]?.id ?? '')}"]`)
+        || el.querySelectorAll('tr.virtual-row')[local]
+      : null
+
+    let yStart
+    let yEnd
+    if (tr) {
+      // Position of row relative to scroll content: current scrollTop + offset from viewport top - header.
+      const gRect = el.getBoundingClientRect()
+      const tRect = tr.getBoundingClientRect()
+      const rowTopInContent = el.scrollTop + (tRect.top - gRect.top) - headerH
+      const rowH = tRect.height
+      yStart = Math.max(0, rowTopInContent)
+      yEnd = Math.max(0, el.scrollTop + (tRect.bottom - gRect.top) - el.clientHeight)
+      // Simpler: bring row under sticky header / into view using element offset within table body.
+      // rowTopInContent above already accounts for current layout (variable heights).
+      if (align === 'end') {
+        yEnd = Math.max(0, yStart + rowH + headerH - el.clientHeight)
+      }
+    } else {
+      yStart = r * ROWH
+      yEnd = Math.max(0, headerH + (r + 1) * ROWH - el.clientHeight)
+    }
+
+    if (align === 'start') el.scrollTop = yStart
+    else if (align === 'end') el.scrollTop = yEnd
+    else {
+      const viewTop = el.scrollTop
+      const viewBot = el.scrollTop + el.clientHeight
+      if (tr) {
+        const gRect = el.getBoundingClientRect()
+        const tRect = tr.getBoundingClientRect()
+        // Fully above sticky header area, or clipped below viewport.
+        if (tRect.top < gRect.top + headerH) el.scrollTop = yStart
+        else if (tRect.bottom > gRect.bottom) el.scrollTop = yEnd
+      } else {
+        const rowDocBot = headerH + (r + 1) * ROWH
+        if (yStart < viewTop) el.scrollTop = yStart
+        else if (rowDocBot > viewBot) el.scrollTop = yEnd
+      }
+    }
+    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight)
+    if (el.scrollTop > maxTop) el.scrollTop = maxTop
+    this._scrollTop = el.scrollTop
+    this._scrollDirty = true
+    this.onScroll({ target: el })
+    this.ensureWindow({ reset: false })
   },
   get selReadout() {
     if (!this.sel.ranges.length) return ''
@@ -898,8 +1441,8 @@ function createApp() {
     })
   },
   // m-js full redraw rebuilds the DOM and resets scroll containers; snapshot/restore.
-  // Restore synchronously after redraw (not only in rAF) so rapid cell-state redraws
-  // during a run cannot yank the log back to an old snap while the user is scrolling.
+  // CRITICAL: never yank grid scrollTop back to a stale snap while the user is flinging —
+  // that was the scrollbar "recoil". Prefer live _scrollTop; skip follow-up if user moved.
   preserveUiScroll(run) {
     if (this._preservingScroll) return run()
     this._preservingScroll = true
@@ -907,9 +1450,13 @@ function createApp() {
     const log = document.querySelector('.logbox')
     const chat = document.querySelector('.chat .messages')
     const nearBottom = (el, pad = 40) => !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= pad
+    // Prefer the scroll position the user is driving (onScroll), not a possibly-stale DOM read.
+    const gTop = this._scrollTop ?? grid?.scrollTop ?? 0
+    const gLeft = this._scrollLeft ?? grid?.scrollLeft ?? 0
     const snap = {
-      gTop: grid?.scrollTop ?? 0,
-      gLeft: grid?.scrollLeft ?? 0,
+      gTop,
+      gLeft,
+      gridUserAt: this._gridUserScrollAt ?? 0,
       logTop: log?.scrollTop ?? 0,
       logPinned: this.logPinned,
       logUserAt: this._logUserScrollAt ?? 0,
@@ -917,15 +1464,47 @@ function createApp() {
       chatPinned: nearBottom(chat),
     }
     try { run() } finally { this._preservingScroll = false }
-    this.restoreUiScroll(snap)
-    // one follow-up frame for layout (images/fonts); skip log if user scrolled since snap
-    requestAnimationFrame(() => this.restoreUiScroll(snap, { followUp: true }))
+    this.restoreUiScroll(snap, { followUp: false })
+    // Follow-up only for log/chat layout; grid is restored once and then left alone
+    // unless the user has not scrolled since the snap (see restoreUiScroll).
+    this._scrollRestoreGen = (this._scrollRestoreGen ?? 0) + 1
+    const gen = this._scrollRestoreGen
+    requestAnimationFrame(() => {
+      if (gen !== this._scrollRestoreGen) return
+      this.restoreUiScroll(snap, { followUp: true })
+      // Scroll events during redraw only set the dirty flag — run ensure now.
+      if (this._scrollDirty && !this._scrollRaf) {
+        this._scrollRaf = requestAnimationFrame(() => {
+          this._scrollRaf = 0
+          if (!this._scrollDirty) return
+          this.ensureWindow({ reset: false })
+        })
+      }
+    })
   },
   restoreUiScroll(snap, { followUp = false } = {}) {
     const g = document.querySelector('.gridwrap')
     if (g) {
-      g.scrollTop = snap.gTop
-      g.scrollLeft = snap.gLeft
+      const userScrolledSince = (this._gridUserScrollAt ?? 0) > (snap.gridUserAt ?? 0)
+      // Follow-up must never yank the grid mid-fling (primary recoil cause).
+      if (followUp && userScrolledSince) {
+        // leave grid where the user put it
+      } else {
+        // Live user intent always wins; snap is only a fallback.
+        const top = this._scrollTop ?? snap.gTop
+        const left = this._scrollLeft ?? snap.gLeft
+        if (Math.abs((g.scrollTop ?? 0) - top) > 0.5 || Math.abs((g.scrollLeft ?? 0) - left) > 0.5) {
+          this._programmaticGridScroll = true
+          try {
+            g.scrollTop = top
+            g.scrollLeft = left
+          } finally {
+            this._programmaticGridScroll = false
+          }
+        }
+        this._scrollTop = g.scrollTop
+        this._scrollLeft = g.scrollLeft
+      }
     }
     const l = document.querySelector('.logbox')
     if (l) {
@@ -2331,7 +2910,7 @@ function createApp() {
         </div>
       </div>
 
-      <div class="gridwrap" x-show="!focus" @scroll="onScroll()" @mouseup="cellUp()">
+      <div class="gridwrap" x-show="!focus" @scroll="onScroll($event)" @mouseup="cellUp()">
         <table class="grid" :class="(colResize ? 'col-resizing ' : '') + (rowResize ? 'row-resizing' : '')">
           <thead>
             <tr>
@@ -2411,9 +2990,14 @@ function createApp() {
               </th>
             </tr>
           </thead>
-          <tbody>
-            <tr x-show="topPad > 0"><td :colspan="columns.length + 1" :style="'height:' + topPad + 'px;padding:0;border:0'"></td></tr>
-            <tr x-for="row, i in rows" :key="row.id" :data-row-id="row.id" :class="rowClass(row)" :style="rowStyle(row)">
+          <tbody class="virtual-body" :class="rowHeightMode" :style="'transform:' + bodyTransform">
+            <!-- Spacers for virtual windows; full-load natural mode keeps pads at 0. -->
+            <tr class="virtual-spacer virtual-spacer-top" aria-hidden="true">
+              <td :colspan="columns.length + 1">
+                <div class="virtual-spacer-fill" :style="'height:' + topPad + 'px'"></div>
+              </td>
+            </tr>
+            <tr class="virtual-row" x-for="row, i in rows" :key="row.id" :data-row-id="row.id" :class="rowClass(row)" :style="rowStyle(row)">
               <td class="rowhead" :class="rowSelected(i) ? 'selected-head' : ''" @click="rowHeadClick(i, $event)">
                 <span class="rownum" x-text="winStart + i + 1"></span>
                 <span class="row-main">
@@ -2436,8 +3020,12 @@ function createApp() {
                 <div class="cell-inner" x-html="cellHtml(row, ci)"></div>
               </td>
             </tr>
-              <tr x-show="bottomPad > 0"><td :colspan="columns.length + 1" :style="'height:' + bottomPad + 'px;padding:0;border:0'"></td></tr>
-            </tbody>
+            <tr class="virtual-spacer virtual-spacer-bot" aria-hidden="true">
+              <td :colspan="columns.length + 1">
+                <div class="virtual-spacer-fill" :style="'height:' + bottomPad + 'px'"></div>
+              </td>
+            </tr>
+          </tbody>
           </table>
         </div>
 

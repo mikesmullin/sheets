@@ -121,8 +121,62 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); }
 /* grid
    sticky headers need separate borders (collapse breaks sticky in some engines)
    and must not be overridden by later `position: relative` rules used for resize handles */
-.gridwrap { flex: 1; overflow: auto; position: relative; }
+.gridwrap { flex: 1; overflow: auto; position: relative;
+  /* Isolate scroll layout from the rest of the app chrome. */
+  contain: layout style;
+  /* Scroll anchoring adjusts scrollTop when DOM above the viewport changes
+     (virtual spacers / row recycle / full m-js redraw) — feels like recoil. */
+  overflow-anchor: none;
+  overscroll-behavior: contain; }
 table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: max-content; }
+.grid tbody.virtual-body {
+  /* GPU layer; pad rows keep scroll geometry — avoid per-row top/left writes. */
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+  contain: layout style;
+}
+/* Full-load (≤500 rows): natural/variable heights — .cell-tall and row resize grow rows. */
+.grid tbody.virtual-body.rows-natural tr.virtual-row {
+  contain: layout style;
+}
+/* Virtual window (>500 rows): fixed ROWH so spacer math stays stable. */
+.grid tbody.virtual-body.rows-fixed tr.virtual-row {
+  contain: layout style paint;
+  height: var(--row-h, var(--rowh));
+}
+.grid tbody.virtual-body.rows-fixed tr.virtual-row > td {
+  height: var(--row-h, var(--rowh));
+  max-height: var(--row-h, var(--rowh));
+  overflow: hidden;
+  vertical-align: top;
+}
+.grid tbody.virtual-body.rows-fixed tr.virtual-row > td > .cell-inner {
+  height: calc(var(--row-h, var(--rowh)) - 2px);
+  max-height: calc(var(--row-h, var(--rowh)) - 2px);
+  min-height: 0;
+  overflow: hidden;
+}
+.grid tbody.virtual-body.rows-fixed tr.virtual-row td:has(.cell-tall) {
+  white-space: normal;
+  text-overflow: clip;
+}
+.grid tbody.virtual-body.rows-fixed tr.virtual-row td:has(.cell-tall) > .cell-inner {
+  white-space: normal;
+  text-overflow: clip;
+}
+.grid tbody.virtual-body.rows-fixed tr.virtual-row .cell-tall {
+  max-height: 100%;
+  overflow: hidden;
+}
+.grid tbody.virtual-body tr.virtual-spacer td {
+  border: 0 !important; padding: 0 !important; background: transparent !important;
+  height: 0 !important; line-height: 0 !important; font-size: 0 !important;
+  vertical-align: top;
+}
+/* Inner div is the real spacer height — <td height> is unreliable in tables. */
+.grid tbody.virtual-body tr.virtual-spacer .virtual-spacer-fill {
+  display: block; width: 1px; overflow: hidden; pointer-events: none;
+}
 .grid th, .grid td { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
   padding: 0 6px; height: var(--rowh); width: 180px; overflow: hidden; white-space: nowrap;
   text-overflow: ellipsis; background: var(--bg); vertical-align: middle; }
