@@ -19,6 +19,36 @@ export resolveDbPaths = (root, dbOpt, configDb) ->
   out.push path.resolve(root, 'db') unless out.length
   out
 
+# A database belongs to at most one sheets server. `wx` makes acquisition atomic
+# across concurrent processes; a lock remains intentionally visible after a crash.
+export acquireDbLocks = (dbs, info = {}) ->
+  locks = []
+  file = null
+  currentAcquired = false
+  try
+    for db in dbs
+      fs.mkdirSync db, recursive: true
+      file = path.join db, '.lock'
+      fd = fs.openSync file, 'wx'
+      currentAcquired = true
+      try
+        fs.writeFileSync fd, JSON.stringify({ pid: process.pid, started: new Date().toISOString(), ...info }, null, 2) + '\n'
+      finally
+        fs.closeSync fd
+      locks.push file
+      currentAcquired = false
+    locks
+  catch err
+    fs.rmSync file, force: true if currentAcquired and file?
+    fs.rmSync lock, force: true for lock in locks
+    if err?.code is 'EEXIST'
+      throw new Error "sheets database is locked: #{file} (remove it only after confirming no sheets server is using that database)"
+    throw err
+
+export releaseDbLocks = (locks = []) ->
+  fs.rmSync file, force: true for file in locks
+  null
+
 export resolveWorkspace = (opts = {}) ->
   root = path.resolve opts.root ? process.cwd()
   sheetsDir = path.join root, '.sheets'

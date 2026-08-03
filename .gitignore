@@ -3,6 +3,7 @@ node_modules/
 **/.sheets/runs/
 **/.sheets/pgdata/
 **/.sheets/server.json
+**/.lock
 **/.angela/sessions/
 
 # testing

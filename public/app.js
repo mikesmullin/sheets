@@ -79,13 +79,29 @@ function createApp() {
   _searchDebounce: null,
   focus: null, // {slug, source, meta, results, busy}
   toast: '', tabMenu: null, tabRename: null,
-  fieldMenu: false,
+  fieldMenu: false, columnPickerFilter: '',
 
   // ---- derived ----
   get act() { return this.meta?.activities?.find((a) => a.slug === this.actSlug) ?? this.meta?.activities?.[0] ?? null },
   // Full ordered catalog (includes hidden). Grid/A1 use `columns` (visible only).
   get fullColumns() { return this.act?.columns ?? [] },
   get columns() { return this.fullColumns.filter((c) => !c.hidden) },
+  get columnPickerNeedle() { return this.columnPickerFilter.trim().toLowerCase() },
+  get filteredStages() {
+    const needle = this.columnPickerNeedle
+    if (!needle) return this.stageTree ?? []
+    return (this.stageTree ?? []).filter((stage) => `${stage.title ?? ''} ${stage.slug ?? ''}`.toLowerCase().includes(needle))
+  },
+  get filteredFieldTree() {
+    const needle = this.columnPickerNeedle
+    if (!needle) return this.fieldTree ?? []
+    return (this.fieldTree ?? []).flatMap((group) => {
+      const componentMatches = group.component.toLowerCase().includes(needle)
+      const fields = componentMatches ? group.fields : group.fields.filter((field) => `${field.name} ${field.path}`.toLowerCase().includes(needle))
+      return fields.length ? [{ ...group, fields }] : []
+    })
+  },
+  get filteredFieldCount() { return this.filteredFieldTree.reduce((count, group) => count + group.fields.length, 0) },
   // Map a visible column index to an index in fullColumns.
   fullIndexFromVisible(vi) {
     let v = 0
@@ -1922,7 +1938,13 @@ function createApp() {
     })
     const result = await this.persistActivity({ columns: normalized, componentLocks })
     if (!result) return false
-    await this.loadMeta(false)
+    const activity = this.meta?.activities?.find((entry) => entry.slug === this.actSlug)
+    if (activity) {
+      activity.columns = normalized
+      activity.componentLocks = componentLocks
+      activity.revision = result.revision ?? activity.revision + 1
+    }
+    this.componentLocks = componentLocks
     this.redrawGrid()
     return true
   },
@@ -2125,6 +2147,7 @@ function createApp() {
   },
   async reloadPersisted(ev) {
     if (ev.resource === 'activity') {
+      if (ev.slug === this.actSlug && Number(ev.revision) === Number(this.act?.revision)) return
       // Activity YAML changed (columns etc.) — meta refresh is enough; avoid scroll churn.
       await this.loadMeta(false)
       this.redrawGrid()
@@ -2838,14 +2861,23 @@ function createApp() {
             <i class="ph-fill ph-caret-down toolbar-dropdown-caret" aria-hidden="true"></i>
           </button>
           <div class="menu" x-show="fieldMenu">
+            <div class="column-picker-filter" :class="columnPickerFilter ? 'has-clear' : ''">
+              <i class="ph-bold ph-funnel" aria-hidden="true"></i>
+              <input id="sheets-column-picker-filter" type="search" placeholder="filter columns…" spellcheck="false"
+                :value="columnPickerFilter" @input="columnPickerFilter = $event.target.value"
+                @keydown="if ($event.key === 'Escape') { $event.preventDefault(); columnPickerFilter = '' }">
+              <button type="button" class="field-clear" x-show="columnPickerFilter" @click="columnPickerFilter = ''" title="clear column filter">
+                <i class="ph-bold ph-x" aria-hidden="true"></i>
+              </button>
+            </div>
             <div class="column-group-heading">
-              <span>Stages</span>
+              <span>Stages <small x-text="filteredStages.length"></small></span>
               <span class="column-group-bulk">
                 <button type="button" class="bulk-link" @click.stop="setStageColumnsVisible(true)" title="show all stages">all</button>
                 <button type="button" class="bulk-link" @click.stop="setStageColumnsVisible(false)" title="hide all stages">none</button>
               </span>
             </div>
-            <div class="stage-toggle" x-for="stage in stageTree" :key="stage.slug">
+            <div class="stage-toggle" x-for="stage in filteredStages" :key="stage.slug">
               <label class="col-menu-main">
                 <input type="checkbox" :checked="hasStageColumn(stage.slug)" @change="toggleStageColumn(stage.slug)">
                 <span class="col-menu-label" x-text="stage.title"></span>
@@ -2858,13 +2890,13 @@ function createApp() {
               </span>
             </div>
             <div class="column-group-heading">
-              <span>Component fields</span>
+              <span>Component fields <small x-text="filteredFieldCount"></small></span>
               <span class="column-group-bulk">
                 <button type="button" class="bulk-link" @click.stop="setFieldColumnsVisible(true)" title="show all fields">all</button>
                 <button type="button" class="bulk-link" @click.stop="setFieldColumnsVisible(false)" title="hide all fields">none</button>
               </span>
             </div>
-            <div class="component-group" x-for="group in fieldTree" :key="group.component">
+            <div class="component-group" x-for="group in filteredFieldTree" :key="group.component">
               <label class="component-toggle">
                 <input type="checkbox" :checked="componentLocked(group.component)" @change="toggleComponent(group)">
                 <span x-text="group.component"></span>

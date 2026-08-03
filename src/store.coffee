@@ -17,6 +17,7 @@ export class Store
     @db = null
     @sources = new Set()
     @memory = opts.memory ? false
+    @import = { state: 'idle', source: null, completed: 0, total: 0, startedAt: null, finishedAt: null, error: null }
 
   init: ->
     dataDir = if @memory then undefined else @ws.pgdataDir
@@ -43,16 +44,35 @@ export class Store
     null
 
   # full (re)load of a source dir from disk
-  loadSource: (dir) ->
+  importStatus: -> { ...@import }
+
+  loadSource: (dir, opts = {}) ->
     dir = path.resolve dir
     @sources.add dir
-    await @db.query "DELETE FROM entities WHERE source = $1", [dir]
-    n = 0
-    for file in E.walkDb dir
-      { doc } = E.readEntityFile file
-      await @upsert dir, E.idFor(dir, file), doc, fs.statSync(file).mtimeMs
-      n++
-    n
+    files = E.walkDb dir
+    @import = {
+      state: 'running', source: dir, completed: 0, total: files.length
+      startedAt: new Date().toISOString(), finishedAt: null, error: null
+    }
+    try
+      await @db.query "DELETE FROM entities WHERE source = $1", [dir]
+      n = 0
+      for file in files
+        { doc } = E.readEntityFile file
+        await @upsert dir, E.idFor(dir, file), doc, fs.statSync(file).mtimeMs
+        n++
+        @import.completed = n
+        opts.onProgress? @importStatus() if n is files.length or n % 100 is 0
+      @import.state = 'complete'
+      @import.finishedAt = new Date().toISOString()
+      opts.onProgress? @importStatus()
+      n
+    catch err
+      @import.state = 'error'
+      @import.error = String(err?.message ? err)
+      @import.finishedAt = new Date().toISOString()
+      opts.onProgress? @importStatus()
+      throw err
 
   refreshFile: (dir, file) ->
     dir = path.resolve dir
@@ -111,16 +131,21 @@ export class Store
     (row.id for row in r.rows)
 
   # union of component.field dot-paths across docs (column picker).
-  # Default sample is large so undeclared fields on late rows still appear.
-  fieldPaths: (source, sample = 100000) ->
-    r = await @db.query "SELECT doc FROM entities WHERE source = $1 LIMIT $2", [source, sample]
+  # Read in bounded batches: materializing a large JSONB result can exhaust PGlite's WASM heap.
+  fieldPaths: (source, sample = 100000, batchSize = 100) ->
     seen = new Set()
-    for row in r.rows
-      for comp, fields of (row.doc ? {})
-        if fields? and typeof fields is 'object' and not Array.isArray fields
-          seen.add "#{comp}.#{k}" for k of fields
-        else
-          seen.add comp
+    offset = 0
+    while offset < sample
+      limit = Math.min batchSize, sample - offset
+      r = await @db.query "SELECT doc FROM entities WHERE source = $1 ORDER BY id LIMIT $2 OFFSET $3", [source, limit, offset]
+      break unless r.rows.length
+      for row in r.rows
+        for comp, fields of (row.doc ? {})
+          if fields? and typeof fields is 'object' and not Array.isArray fields
+            seen.add "#{comp}.#{k}" for k of fields
+          else
+            seen.add comp
+      offset += r.rows.length
     Array.from(seen).sort()
 
   # Collect non-null sample values for component.field (type guessing).

@@ -77,3 +77,20 @@ YAML on disk is authoritative; the server mirrors every activity source into emb
 
 `bun test test/` — engine invariants (entity lock, gate→idle FSM, merge/null semantics,
 dedupe, run logs) + the 500-fruit benchmark over the HTTP API with a deterministic stub stage.
+
+### Rebuild the local mirror
+
+Entity YAML/Markdown files are authoritative. PGlite under `.sheets/pgdata` is a
+disposable local query mirror. After an interrupted process or a PGlite failure,
+stop `sheets serve` and run:
+
+```sh
+sheets rebuild
+```
+
+The command prints import progress every 100 entities and exits only after every
+source has completed. While the server is starting, `GET /api/import` reports the
+same `state`, `completed`, `total`, and any import error.
+
+Only one `sheets serve` process may use a database directory at a time. The server
+creates `<db>/.lock` with its PID and start time, and removes it on graceful shutdown.

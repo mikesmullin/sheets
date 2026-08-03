@@ -77,7 +77,10 @@ promptStageSlug = (prompt, stages) ->
 
 export startServer = (opts = {}) ->
   ws = CFG.resolveWorkspace opts
-  store = await new Store(ws, memory: opts.memory).init()
+  locks = CFG.acquireDbLocks ws.dbs, { root: ws.root }
+  store = try await new Store(ws, memory: opts.memory).init() catch err
+    CFG.releaseDbLocks locks
+    throw err
   activities = new Activities ws
   stages = new Stages ws
   engine = new Engine ws, store, stages
@@ -152,12 +155,17 @@ export startServer = (opts = {}) ->
     return unless slug
     debounce "stage:#{slug}", 120, -> notifyStageWritten slug
 
+  activitySources = new Map()
   watchSafe ws.activitiesDir, (event, fname) ->
     return unless fname?.match /\.ya?ml$/
     slug = fname.replace /\.ya?ml$/, ''
     debounce "activity:#{slug}", 150, ->
-      await loadAll()
-      persisted 'activity', { slug }
+      current = activities.get slug
+      source = current?.source ? null
+      changedSource = activitySources.get(slug) isnt source
+      activitySources.set slug, source
+      await loadAll() if changedSource
+      persisted 'activity', { slug, revision: current?.revision }
 
   watchedSources = new Set()
   watchSource = (dir) ->
@@ -185,11 +193,19 @@ export startServer = (opts = {}) ->
     dirs = new Set(a.source for a in activities.list())
     dirs.add d for d in (ws.dbs ? [ws.db])
     for dir from dirs when fs.existsSync dir
-      n = await store.loadSource dir
+      n = await store.loadSource dir, onProgress: (progress) ->
+        console.log "sheets: importing #{progress.completed}/#{progress.total} entities from #{dir}" if progress.completed is progress.total or progress.completed % 100 is 0
       watchSource dir
       console.log "sheets: loaded #{n} entities from #{dir}"
+    activitySources.clear()
+    activitySources.set a.slug, a.source for a in activities.list()
     null
-  await loadAll()
+  try
+    await loadAll()
+  catch err
+    await store.close()
+    CFG.releaseDbLocks locks
+    throw err
 
   resolveActivity = (slug) ->
     a = activities.get slug
@@ -356,8 +372,12 @@ export startServer = (opts = {}) ->
       return json {
         root: ws.root, db: ws.db, dbs: (ws.dbs ? [ws.db]), port: ws.port
         model: ws.model, chat: chat.enabled()
+        import: store.importStatus()
         activities: ({ slug: a.slug, title: a.title, source: a.source, columns: a.columns, componentLocks: a.componentLocks, revision: a.revision } for a in acts)
       }
+
+    if p is '/api/import'
+      return json store.importStatus()
 
     if p is '/api/stages'
       out = []
@@ -773,16 +793,17 @@ export startServer = (opts = {}) ->
         body = await req.json()
         if body.revision? and Number(body.revision) isnt Number(activity.revision ? 0)
           return json { error: 'activity revision conflict', revision: activity.revision }, 409
-        activities.update slug, (doc) ->
+        updated = activities.update slug, (doc) ->
           doc.title = body.title if body.title?
           doc.columns = body.columns if body.columns?
           doc.component_locks = body.componentLocks if body.componentLocks?
           doc.rows = { source: body.source } if body.source?
           doc.revision = Number(doc.revision ? 0) + 1
-        # a changed source may need loading
-        await loadAll()
-        persisted 'activity', { slug }
-        return json { ok: true }
+        sourceChanged = body.source? and path.resolve(activity.source) isnt path.resolve(updated.rows.source)
+        await loadAll() if sourceChanged
+        activitySources.set slug, activities.get(slug)?.source ? null
+        persisted 'activity', { slug, revision: updated.revision }
+        return json { ok: true, revision: updated.revision }
 
     if p is '/api/log'
       return json { lines: engine.logRing.slice -500 }
@@ -803,34 +824,40 @@ export startServer = (opts = {}) ->
       'cache-control': 'no-store'
     }
 
-  server = Bun.serve
-    port: ws.port
-    idleTimeout: 120
-    fetch: (req) ->
-      try
-        await handle req
-      catch err
-        console.error 'sheets server error:', err
-        json { error: String(err?.message ? err) }, 500
-    websocket:
-      open: (sock) ->
-        if sock.data?.kind is 'hmr'
-          hmrClients.add sock
-          sock.send JSON.stringify { type: 'connected', version: 'sheets-hmr' }
-          return
-        sockets.add sock
-        sock.send JSON.stringify engine.snapshot()
-        sock.send JSON.stringify { type: 'cells', cells: engine.cellStates() }
-      close: (sock) ->
-        if sock.data?.kind is 'hmr' then hmrClients.delete sock
-        else sockets.delete sock
-      message: (sock, msg) -> null
+  try
+    server = Bun.serve
+      port: ws.port
+      idleTimeout: 120
+      fetch: (req) ->
+        try
+          await handle req
+        catch err
+          console.error 'sheets server error:', err
+          json { error: String(err?.message ? err) }, 500
+      websocket:
+        open: (sock) ->
+          if sock.data?.kind is 'hmr'
+            hmrClients.add sock
+            sock.send JSON.stringify { type: 'connected', version: 'sheets-hmr' }
+            return
+          sockets.add sock
+          sock.send JSON.stringify engine.snapshot()
+          sock.send JSON.stringify { type: 'cells', cells: engine.cellStates() }
+        close: (sock) ->
+          if sock.data?.kind is 'hmr' then hmrClients.delete sock
+          else sockets.delete sock
+        message: (sock, msg) -> null
+  catch err
+    await store.close()
+    CFG.releaseDbLocks locks
+    throw err
 
   CFG.writeServerJson ws, { port: ws.port, pid: process.pid, started: Date.now() }
   cleanup = ->
     CFG.clearServerJson ws
     w.close() for w in watchers
     engine.close()
+    CFG.releaseDbLocks locks
   process.on 'SIGINT', -> cleanup(); process.exit 0
   process.on 'SIGTERM', -> cleanup(); process.exit 0
 

@@ -5,6 +5,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import yaml from 'js-yaml'
 import * as CFG from './config.coffee'
+import { Store } from './store.coffee'
+import { Activities } from './activities.coffee'
 
 HELP = """
 sheets — spreadsheet-driven entity × stage pipeline
@@ -14,6 +16,7 @@ Usage:
 
 Commands:
   serve             start the server (SPA + API) for this workspace
+  rebuild           discard and rebuild the local PGlite mirror from entity files
   init              scaffold .sheets/ and .angela/ in this workspace
   run               enqueue entities × stages and follow progress (walk successor)
   stop              dequeue queued / abort running cells
@@ -303,6 +306,29 @@ cmdClean = (ws) ->
       process.stdout.write "removed stale server.json\n"
   process.stdout.write "removed #{n} run logs\n"
 
+cmdRebuild = (ws) ->
+  info = CFG.readServerJson ws
+  if info?
+    try
+      process.kill info.pid, 0
+      die "stop the running sheets server before rebuilding: kill #{info.pid}"
+    catch
+      CFG.clearServerJson ws
+  fs.rmSync ws.pgdataDir, recursive: true, force: true
+  store = await new Store(ws).init()
+  dirs = new Set(a.source for a in new Activities(ws).list())
+  dirs.add d for d in (ws.dbs ? [ws.db])
+  try
+    for dir from dirs when fs.existsSync dir
+      last = -1
+      n = await store.loadSource dir, onProgress: (progress) ->
+        return if progress.completed is last
+        last = progress.completed
+        process.stdout.write "importing #{progress.completed}/#{progress.total} #{dir}\n"
+      process.stdout.write "complete #{n}/#{n} #{dir}\n"
+  finally
+    await store.close()
+
 cmdLs = (ws, args) ->
   base = serverUrl ws, args
   meta = await api base, '/api/meta'
@@ -360,6 +386,7 @@ export main = (argv) ->
     when 'serve'
       { startServer } = await `import('./server.coffee')`
       await startServer { root: ws.root, db: args.db, port: args.port }
+    when 'rebuild' then await cmdRebuild ws
     when 'init' then cmdInit ws
     when 'run' then await cmdRun ws, args
     when 'stop' then await cmdStop ws, args
