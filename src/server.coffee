@@ -282,7 +282,9 @@ export startServer = (opts = {}) ->
   queryEntities = (activity, opts = {}) ->
     q = opts.q or null
     # Load full set without SQL ILIKE — global search is regex over field values.
-    rows = await store.window activity.source, { offset: 0, limit: 1000000 }
+    # Bounded-batch read (Store#allRows): a single huge-LIMIT query can crash PGlite's
+    # WASM heap and permanently wedge the connection for all later requests.
+    rows = await store.allRows activity.source
     if q
       re = compileFilter q
       if re?

@@ -258,8 +258,22 @@ table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 /* widgets opt into multi-line / taller cells; table row grows with tallest cell */
 .grid td:has(.cell-tall) { white-space: normal; text-overflow: clip; overflow: hidden; vertical-align: top; }
 .grid td:has(.cell-tall) > .cell-inner { white-space: normal; text-overflow: clip; }
-.grid .cell-tall { display: block; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+.grid .cell-tall { display: block; white-space: normal; overflow-wrap: anywhere; word-break: break-word;
   line-height: 1.35; padding: 4px 0; max-width: 100%; }
+.json-tree { color: var(--text); white-space: normal; }
+.json-node { display: inline; }
+.json-children { display: inline; }
+.json-line { display: inline; }
+.json-key { color: #8ec8ff; }
+.json-string { color: #8fd19e; }
+.json-number { color: #e8c56a; }
+.json-bool, .json-null { color: #d2b3ff; }
+.json-punct { color: var(--dim); }
+.json-toggle { display: inline-flex; align-items: center; gap: 2px; height: 17px; min-width: 17px; margin: 0 1px;
+  padding: 0 2px; vertical-align: baseline; color: #9ecbff; background: rgba(77,157,224,.12); border-color: rgba(77,157,224,.3); border-radius: 3px; }
+.json-toggle:hover { color: #cfe6ff; border-color: var(--accent); background: rgba(77,157,224,.22); }
+.json-toggle i { font-size: 10px; line-height: 1; }
+.json-count { font-size: 10px; line-height: 1; }
 .grid .noise-cell { color: var(--text); }
 /* magic row (Β) */
 .magic-cell { display: flex; align-items: center; gap: 4px; }

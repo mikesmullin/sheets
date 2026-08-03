@@ -130,6 +130,22 @@ export class Store
     r = await @db.query "SELECT id FROM entities WHERE source = $1 ORDER BY id #{dirSql}", [source]
     (row.id for row in r.rows)
 
+  # Full row set (id + doc) for a source, read in bounded batches. Callers that need
+  # every row (JS-side filter/sort/search over the whole activity) must go through
+  # this instead of a single large-LIMIT query — materializing ~1000+ JSONB docs in
+  # one PGlite result can exhaust the WASM heap ("out of bounds memory access") and
+  # permanently wedge the connection (every later query on it then fails the same way).
+  allRows: (source, batchSize = 200) ->
+    out = []
+    offset = 0
+    loop
+      r = await @db.query "SELECT id, doc FROM entities WHERE source = $1 ORDER BY id LIMIT $2 OFFSET $3", [source, batchSize, offset]
+      break unless r.rows.length
+      out.push row for row in r.rows
+      offset += r.rows.length
+      break if r.rows.length < batchSize
+    out
+
   # union of component.field dot-paths across docs (column picker).
   # Read in bounded batches: materializing a large JSONB result can exhaust PGlite's WASM heap.
   fieldPaths: (source, sample = 100000, batchSize = 100) ->

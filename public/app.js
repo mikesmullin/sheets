@@ -57,6 +57,7 @@ function createApp() {
   colResize: null, // { ci, width, startX, startW, moved }
   rowHeights: {}, // session-only id -> px; not persisted
   rowResize: null, // { id, startY, startH, moved }
+  jsonExpanded: {}, // session-only cell|branch -> true; nested JSON stays lazy by default
   chat: {
     enabled: false, messages: [], input: '', busy: false, elapsed: '', startedAt: 0, timer: null, stopRequested: false,
     agents: [], agent: '', models: [], model: '', reasoningEffort: 'medium', thinking: false,
@@ -148,6 +149,7 @@ function createApp() {
       }
     }
     this.loadChatPrefs()
+    this.loadColumnPickerFilter()
     await this.loadMeta()
     this.connectWS()
     window.addEventListener('keydown', (e) => this.globalKey(e))
@@ -270,6 +272,13 @@ function createApp() {
       } catch { /* keep prior stages */ }
     }
     M.redraw()
+  },
+  loadColumnPickerFilter() {
+    try { this.columnPickerFilter = localStorage.getItem('sheets-column-picker-filter') ?? '' } catch { /* storage unavailable */ }
+  },
+  setColumnPickerFilter(value) {
+    this.columnPickerFilter = String(value ?? '')
+    try { localStorage.setItem('sheets-column-picker-filter', this.columnPickerFilter) } catch { /* storage unavailable */ }
   },
   async toggleSchemaField(field) {
     if (!this.canPersist()) return
@@ -829,24 +838,47 @@ function createApp() {
         try { return mod.views.cell(row.doc)?.template ?? '' } catch (e) { return `<span class="cellstate">⚠ ${esc(e.message)}</span>` }
       }
       const writes = mod?.meta?.writes?.[0]
-      return writes ? this.widget(getPath(row.doc, writes)) : ''
+      return writes ? this.widget(getPath(row.doc, writes), `${row.id}|${ci}`) : ''
     }
-    if (col.field) return this.widget(getPath(row.doc, col.field))
+    if (col.field) return this.widget(getPath(row.doc, col.field), `${row.id}|${ci}`)
     return ''
   },
-  widget(v) {
+  jsonBranchKey(cellKey, path) { return `${cellKey}|${path}` },
+  jsonValueHtml(v, cellKey, path = '$') {
+    if (v === null) return '<span class="json-null">null</span>'
+    if (typeof v === 'boolean') return `<span class="json-bool">${v}</span>`
+    if (typeof v === 'number') return `<span class="json-number">${esc(v)}</span>`
+    if (typeof v === 'string') return `<span class="json-string">&quot;${esc(v)}&quot;</span>`
+    if (!v || typeof v !== 'object') return `<span>${esc(v)}</span>`
+
+    const array = Array.isArray(v)
+    const entries = array ? v.map((value, index) => [String(index), value]) : Object.entries(v)
+    const key = this.jsonBranchKey(cellKey, path)
+    const expanded = this.jsonExpanded[key] === true
+    const open = array ? '[' : '{'
+    const close = array ? ']' : '}'
+    if (!expanded) {
+      return `<span class="json-node json-collapsed">${open}<button type="button" class="json-toggle" data-json-key="${encodeURIComponent(key)}" title="expand ${array ? 'array' : 'object'}"><span class="json-count">${entries.length}</span><i class="ph-bold ph-plus" aria-hidden="true"></i></button>${close}</span>`
+    }
+    const children = entries.map(([name, value]) => {
+      const childPath = `${path}/${name.replaceAll('~', '~0').replaceAll('/', '~1')}`
+      const label = array ? '' : `<span class="json-key">&quot;${esc(name)}&quot;</span><span class="json-punct">: </span>`
+      return `<span class="json-line">${label}${this.jsonValueHtml(value, cellKey, childPath)}</span>`
+    }).join('<span class="json-punct">,</span>')
+    return `<span class="json-node json-expanded">${open}<button type="button" class="json-toggle" data-json-key="${encodeURIComponent(key)}" title="collapse ${array ? 'array' : 'object'}"><i class="ph-bold ph-minus" aria-hidden="true"></i></button>${children ? `<span class="json-children">${children}</span>` : ''}${close}</span>`
+  },
+  widget(v, cellKey = '') {
     if (v === undefined) return '<span style="color:var(--dim)">—</span>'
     if (v === null) return '<span style="color:var(--dim)">—</span>'
     if (typeof v === 'boolean') return `<input type="checkbox" disabled ${v ? 'checked' : ''}>`
     if (typeof v === 'number') return `<span style="float:right;font-family:ui-monospace,monospace">${esc(v)}</span>`
-    if (Array.isArray(v)) return `<span style="color:var(--dim)">[…] ${v.length} items</span>`
-    if (typeof v === 'object') return `<span style="color:var(--dim)">{…} ${Object.keys(v).length} keys</span>`
+    if (Array.isArray(v) || typeof v === 'object') return `<span class="cell-tall json-tree">${this.jsonValueHtml(v, cellKey)}</span>`
     const s = String(v)
     if (/^#[0-9a-f]{6}$/i.test(s)) return `<span class="cell-swatch"><span class="swatch" style="background:${esc(s)}"></span>${esc(s)}</span>`
     if (/^\d{4}-\d{2}-\d{2}([T ].*)?$/.test(s)) return `<span title="${esc(s)}">${esc(new Date(s).toLocaleDateString())}</span>`
     if (/^https?:\/\//.test(s)) return `<a href="${esc(s)}" target="_blank">${esc(s)}</a>`
     if (s.includes('\n')) return `${esc(s.split('\n')[0])} <span style="color:var(--dim)">¶${s.split('\n').length}</span>`
-    return esc(s)
+    return `<span title="${esc(s)}">${esc(s)}</span>`
   },
   cellStateClass(row, ci) {
     const col = this.columns[ci]
@@ -858,6 +890,29 @@ function createApp() {
   // ---- selection (Ι) ----
   absRow(i) { return this.winStart + i },
   cellDown(i, ci, e) {
+    const toggle = e.target.closest?.('.json-toggle')
+    if (toggle) {
+      e.preventDefault()
+      e.stopPropagation()
+      const key = decodeURIComponent(toggle.dataset.jsonKey ?? '')
+      if (key) {
+        this.jsonExpanded = { ...this.jsonExpanded, [key]: !this.jsonExpanded[key] }
+        this.redrawGrid()
+        requestAnimationFrame(() => {
+          const row = this.rows[i]
+          const cell = document.querySelector(`td[data-r="${i}"][data-c="${ci}"]`)
+          const content = cell?.querySelector('.json-tree')
+          if (!row?.id || !cell || !content) return
+          const expanded = content.querySelector('.json-expanded')
+          const nextHeights = { ...this.rowHeights }
+          if (expanded) nextHeights[row.id] = Math.max(ROWH, Math.ceil(content.scrollHeight) + 8)
+          else delete nextHeights[row.id]
+          this.rowHeights = nextHeights
+          this.redrawGrid()
+        })
+      }
+      return
+    }
     if (this.editing) this.commitEdit()
     const r = this.absRow(i)
     if (e.shiftKey && this.sel.anchor) {
@@ -1949,31 +2004,22 @@ function createApp() {
     return true
   },
   redrawGrid() { M.redraw() },
-  componentLocked(component) { return !!this.componentLocks[component] },
+  componentChecked(group) { return group.fields.length > 0 && group.fields.every((field) => this.hasFieldColumn(field.path)) },
   async toggleComponent(group) {
     if (!this.canPersist()) return
-    const lock = this.componentLocks[group.component]
-    if (!lock) {
-      const snapshot = Object.fromEntries(group.fields.map((field) => [field.path, this.hasFieldColumn(field.path)]))
-      const added = group.fields.filter((field) => !snapshot[field.path]).map((field) => field.path)
-      const columns = copyColumns(this.fullColumns)
-      for (const path of added) {
-        const existing = columns.find((c) => c.field === path)
-        if (existing) this.setColumnHidden(existing, false)
-        else columns.push({ field: path })
-      }
-      const locks = { ...this.componentLocks, [group.component]: { snapshot, added } }
-      await this.patchColumns(columns, locks)
-    } else {
-      const forced = new Set(lock.added)
-      const columns = copyColumns(this.fullColumns)
-      for (const c of columns) {
-        if (c.field && forced.has(c.field)) this.setColumnHidden(c, true)
-      }
-      const locks = { ...this.componentLocks }
-      delete locks[group.component]
-      await this.patchColumns(columns, locks)
+    const show = !this.componentChecked(group)
+    const paths = new Set(group.fields.map((field) => field.path))
+    const columns = copyColumns(this.fullColumns)
+    for (const column of columns) {
+      if (column.field && paths.has(column.field)) this.setColumnHidden(column, !show)
     }
+    if (show) {
+      for (const path of paths) {
+        if (!columns.some((column) => column.field === path)) columns.push({ field: path })
+      }
+    }
+    // Component selections are bulk actions, not persistent input locks.
+    await this.patchColumns(columns, {})
     M.redraw()
   },
   async toggleFieldPath(path) { await this.toggleFieldColumn(path) },
@@ -2864,9 +2910,9 @@ function createApp() {
             <div class="column-picker-filter" :class="columnPickerFilter ? 'has-clear' : ''">
               <i class="ph-bold ph-funnel" aria-hidden="true"></i>
               <input id="sheets-column-picker-filter" type="search" placeholder="filter columns…" spellcheck="false"
-                :value="columnPickerFilter" @input="columnPickerFilter = $event.target.value"
-                @keydown="if ($event.key === 'Escape') { $event.preventDefault(); columnPickerFilter = '' }">
-              <button type="button" class="field-clear" x-show="columnPickerFilter" @click="columnPickerFilter = ''" title="clear column filter">
+                :value="columnPickerFilter" @input="setColumnPickerFilter($event.target.value)"
+                @keydown="if ($event.key === 'Escape') { $event.preventDefault(); setColumnPickerFilter('') }">
+              <button type="button" class="field-clear" x-show="columnPickerFilter" @click="setColumnPickerFilter('')" title="clear column filter">
                 <i class="ph-bold ph-x" aria-hidden="true"></i>
               </button>
             </div>
@@ -2898,12 +2944,12 @@ function createApp() {
             </div>
             <div class="component-group" x-for="group in filteredFieldTree" :key="group.component">
               <label class="component-toggle">
-                <input type="checkbox" :checked="componentLocked(group.component)" @change="toggleComponent(group)">
+                <input type="checkbox" :checked="componentChecked(group)" @change="toggleComponent(group)">
                 <span x-text="group.component"></span>
               </label>
               <div class="field-toggle" x-for="field in group.fields" :key="field.path">
                 <label class="col-menu-main">
-                  <input type="checkbox" :checked="hasFieldColumn(field.path)" :disabled="componentLocked(group.component)"
+                  <input type="checkbox" :checked="hasFieldColumn(field.path)"
                     @change="toggleFieldPath(field.path)">
                   <span class="col-menu-label" :class="field.inSchema ? 'in-schema' : 'undeclared'" x-text="field.name"></span>
                 </label>
