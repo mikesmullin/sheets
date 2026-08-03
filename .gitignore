@@ -1,0 +1,10 @@
+tmp/
+node_modules/
+**/.sheets/runs/
+**/.sheets/pgdata/
+**/.sheets/server.json
+**/.angela/sessions/
+
+# testing
+/examples/
+/test/

@@ -1,0 +1,26 @@
+{
+  "name": "sheets",
+  "version": "0.0.1",
+  "description": "Spreadsheet-driven entity × stage pipeline: rows are entities, columns are stages, Play runs any selected slice through a concurrency-controlled queue.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "sheets": "bin/sheets.mjs"
+  },
+  "scripts": {
+    "start": "bun bin/sheets.mjs serve",
+    "test": "bun test test/"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.2.0",
+    "agl-ai": "link:agl-ai",
+    "angela": "link:angela",
+    "bun-coffeescript": "^1.0.0",
+    "coffeescript": "^2.7.0",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.1"
+  }
+}

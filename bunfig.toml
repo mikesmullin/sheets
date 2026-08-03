@@ -1,0 +1,4 @@
+preload = ["bun-coffeescript/register"]
+
+[test]
+preload = ["bun-coffeescript/register"]
