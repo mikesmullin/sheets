@@ -74,7 +74,36 @@ function createApp() {
 
   // ---- derived ----
   get act() { return this.meta?.activities?.find((a) => a.slug === this.actSlug) ?? this.meta?.activities?.[0] ?? null },
-  get columns() { return this.act?.columns ?? [] },
+  // Full ordered catalog (includes hidden). Grid/A1 use `columns` (visible only).
+  get fullColumns() { return this.act?.columns ?? [] },
+  get columns() { return this.fullColumns.filter((c) => !c.hidden) },
+  // Map a visible column index to an index in fullColumns.
+  fullIndexFromVisible(vi) {
+    let v = 0
+    const full = this.fullColumns
+    for (let i = 0; i < full.length; i++) {
+      if (full[i].hidden) continue
+      if (v === vi) return i
+      v++
+    }
+    return -1
+  },
+  // Insert position in fullColumns for a new column that should appear at visible index `at`.
+  fullInsertIndex(at) {
+    const full = this.fullColumns
+    if (at >= this.columns.length) return full.length
+    let v = 0
+    for (let i = 0; i < full.length; i++) {
+      if (full[i].hidden) continue
+      if (v === at) return i
+      v++
+    }
+    return full.length
+  },
+  setColumnHidden(col, hidden) {
+    if (hidden) col.hidden = true
+    else delete col.hidden
+  },
 
   async init() {
     // Full m-js redraw rebuilds DOM and drops scrollTop; always snapshot/restore.
@@ -122,12 +151,96 @@ function createApp() {
       fetch('/api/stages').then((response) => response.json()),
     ])
     this.fields = fieldData.fields
+    // components[].fields may be string names (legacy) or { name, path, inSchema }
     this.fieldTree = fieldData.components.map((group) => ({
       component: group.component,
-      fields: group.fields.map((name) => ({ name, path: `${group.component}.${name}` })),
+      fields: (group.fields ?? []).map((entry) => {
+        if (entry && typeof entry === 'object') {
+          return {
+            name: entry.name,
+            path: entry.path ?? `${group.component}.${entry.name}`,
+            inSchema: entry.inSchema === true,
+          }
+        }
+        return { name: entry, path: `${group.component}.${entry}`, inSchema: false }
+      }),
     }))
     this.stageTree = stageData.stages
     this.componentLocks = this.act?.componentLocks ?? {}
+  },
+  async reloadFieldTree() {
+    const fieldData = await (await fetch(`/api/fields?activity=${this.actSlug}`)).json()
+    this.fields = fieldData.fields
+    this.fieldTree = fieldData.components.map((group) => ({
+      component: group.component,
+      fields: (group.fields ?? []).map((entry) => {
+        if (entry && typeof entry === 'object') {
+          return {
+            name: entry.name,
+            path: entry.path ?? `${group.component}.${entry.name}`,
+            inSchema: entry.inSchema === true,
+          }
+        }
+        return { name: entry, path: `${group.component}.${entry}`, inSchema: false }
+      }),
+    }))
+    M.redraw()
+  },
+  async toggleFieldMenu() {
+    this.fieldMenu = !this.fieldMenu
+    if (this.fieldMenu) {
+      // Refresh discovery so newly written fields (e.g. animal.noise) appear.
+      try { await this.reloadFieldTree() } catch { /* keep prior tree */ }
+      try {
+        const stageData = await (await fetch('/api/stages')).json()
+        this.stageTree = stageData.stages
+      } catch { /* keep prior stages */ }
+    }
+    M.redraw()
+  },
+  async toggleSchemaField(field) {
+    if (!this.canPersist()) return
+    const action = field.inSchema ? 'remove' : 'add'
+    const label = field.inSchema
+      ? `Remove ${field.path} from schema.yaml?`
+      : `Add ${field.path} to schema.yaml (type guessed from entity values)?`
+    if (!confirm(label)) return
+    const r = await (await fetch('/api/fields/schema', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ activity: this.actSlug, field: field.path, action }),
+    })).json()
+    if (!r.ok) return this.showToast(r.error ?? 'schema update failed')
+    await this.reloadFieldTree()
+    this.showToast(action === 'add' ? `schema + ${field.path} (${r.type ?? 'string'})` : `schema − ${field.path}`)
+  },
+  async deleteFieldEverywhere(field) {
+    if (!this.canPersist()) return
+    if (!confirm(`Delete field ${field.path} from ALL entities in this dataset?\n\nThis cannot be undone.`)) return
+    const r = await (await fetch('/api/fields/delete', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ activity: this.actSlug, field: field.path }),
+    })).json()
+    if (!r.ok) return this.showToast(r.error ?? 'field delete failed')
+    // Drop field from ordered catalog (not just hide)
+    if (this.fullColumns.some((c) => c.field === field.path)) {
+      const columns = copyColumns(this.fullColumns).filter((c) => c.field !== field.path)
+      await this.patchColumns(columns)
+    }
+    await this.reloadFieldTree()
+    await this.refreshWindow(false)
+    this.showToast(`removed ${field.path} from ${r.changed} entit${r.changed === 1 ? 'y' : 'ies'}`)
+  },
+  async deleteStageFile(stage) {
+    if (!this.canPersist()) return
+    const slug = stage.slug ?? stage
+    if (!confirm(`Delete stage "${slug}" from disk?\n\nThis removes .sheets/stages/${slug}.coffee and drops the column from all activities.`)) return
+    const r = await (await fetch('/api/stage/delete', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ slug }),
+    })).json()
+    if (!r.ok) return this.showToast(r.error ?? 'stage delete failed')
+    await this.loadMeta(false)
+    this.showToast(`deleted stage ${slug}`)
   },
   canPersist() { return !this.desynced },
   markDesync() {
@@ -409,8 +522,10 @@ function createApp() {
       const prevWidth = this.columns[ci]?.width
       if (prevWidth != null && width === normalizeColWidth(prevWidth)) return
       if (!this.canPersist()) return this.showToast('refresh to sync before resizing columns')
-      const columns = copyColumns(this.columns)
-      columns[ci] = { ...columns[ci], width }
+      const columns = copyColumns(this.fullColumns)
+      const fi = this.fullIndexFromVisible(ci)
+      if (fi < 0) return
+      columns[fi] = { ...columns[fi], width }
       try {
         await this.patchColumns(columns)
       } catch (error) {
@@ -588,9 +703,35 @@ function createApp() {
       return a === b ? a : `${a}:${b}`
     }).join(',')
   },
-  get entityCountLabel() {
-    const n = this.total ?? 0
-    return `${n} entit${n === 1 ? 'y' : 'ies'}`
+  // Selection impact for play: unique entities, unique stages, enqueueable jobs.
+  selectionPlayStats() {
+    if (!this.sel?.ranges?.length) return null
+    const entities = new Set()
+    const stages = new Set()
+    const jobs = new Set()
+    for (const g of this.sel.ranges) {
+      for (let r = Math.max(0, g.r0); r <= Math.min(this.total - 1, g.r1); r++) {
+        entities.add(r)
+        for (let c = Math.max(0, g.c0); c <= Math.min(this.columns.length - 1, g.c1); c++) {
+          const stage = this.columns[c]?.stage
+          if (!stage) continue
+          stages.add(stage)
+          jobs.add(`${r}|${stage}`)
+        }
+      }
+    }
+    return { entities: entities.size, stages: stages.size, jobs: jobs.size }
+  },
+  get playSummaryLabel() {
+    const stats = this.selectionPlayStats()
+    if (!stats) {
+      const n = this.total ?? 0
+      return `${n} entit${n === 1 ? 'y' : 'ies'}`
+    }
+    const e = `${stats.entities} entit${stats.entities === 1 ? 'y' : 'ies'}`
+    const s = `${stats.stages} stage${stats.stages === 1 ? '' : 's'}`
+    const j = `${stats.jobs} job${stats.jobs === 1 ? '' : 's'}`
+    return `${e}, ${s} = ${j}`
   },
   async copySelReadout() {
     const text = this.selReadout
@@ -1029,10 +1170,35 @@ function createApp() {
   // ---- run bar ----
   async play() {
     if (!this.sel.ranges.length) return this.showToast('nothing selected')
-    const r = await (await fetch('/api/run/range', { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ activity: this.actSlug, range: this.selA1() }) })).json()
-    if (r.skipped?.length) this.showToast(`${r.skipped.length} column(s) have no stage — skipped`)
-    else this.showToast(`enqueued ${r.added}`)
+    // Resolve cells client-side against the visible grid (same order as the play summary).
+    // Server-side A1 re-resolve can disagree after hidden columns / sort / search.
+    const rows = await this.selectedRows()
+    const cells = []
+    const seen = new Set()
+    let skippedFields = 0
+    for (const [rowIndex, columnIndex] of this.selectedCellCoords()) {
+      const row = rows.get(rowIndex)
+      const col = this.columns[columnIndex]
+      if (!row) continue
+      if (!col?.stage) {
+        skippedFields++
+        continue
+      }
+      const key = `${row.id}|${col.stage}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      cells.push({ id: row.id, stage: col.stage })
+    }
+    if (!cells.length) {
+      if (skippedFields) return this.showToast('no playable stage cells in selection (field columns are not playable)')
+      return this.showToast('no playable cells in selection')
+    }
+    const r = await (await fetch('/api/run', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ activity: this.actSlug, cells }),
+    })).json()
+    if (!r.ok && r.error) return this.showToast(r.error)
+    this.showToast(`enqueued ${r.added ?? cells.length}`)
   },
   async stopAll() { await fetch('/api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ all: true }) }) },
 
@@ -1074,12 +1240,33 @@ function createApp() {
     const rows = await this.selectedRows()
     return [...rows.values()].map((row) => row.id)
   },
+  // Path relative to the activity's entity db root (for confirm dialogs).
+  entityPathRelativeToDb(row) {
+    const source = this.act?.source
+    if (row?.file && source) {
+      const root = String(source).replace(/\/+$/, '')
+      if (row.file === root) return row.id ? `${row.id}.yaml` : '.'
+      if (row.file.startsWith(`${root}/`)) return row.file.slice(root.length + 1)
+    }
+    if (row?.file) {
+      const slash = row.file.lastIndexOf('/')
+      return slash >= 0 ? row.file.slice(slash + 1) : row.file
+    }
+    return row?.id ? `${row.id}.yaml` : '(unknown)'
+  },
   async deleteRows() {
     if (!this.canPersist()) return
     if (!this.sel.ranges.length) return this.showToast('select one or more rows first')
-    const ids = await this.selectedRowIds()
+    const selected = await this.selectedRows()
+    const rows = [...selected.values()]
+    const ids = rows.map((row) => row.id)
     if (!ids.length) return this.showToast('no rows selected')
-    if (!confirm(`Delete ${ids.length} row${ids.length === 1 ? '' : 's'} and their YAML files from disk?`)) return
+    const paths = rows.map((row) => this.entityPathRelativeToDb(row))
+    const preview = paths.slice(0, 10)
+    const more = paths.length > 10 ? `\n… and ${paths.length - 10} more` : ''
+    const n = ids.length
+    const msg = `Delete ${n} row${n === 1 ? '' : 's'} and ${n === 1 ? 'its' : 'their'} YAML file${n === 1 ? '' : 's'} from disk?\n\n${preview.join('\n')}${more}`
+    if (!confirm(msg)) return
     const r = await (await fetch('/api/entities/delete', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ activity: this.actSlug, ids }),
     })).json()
@@ -1089,20 +1276,40 @@ function createApp() {
     M.redraw()
     this.showToast(`deleted ${r.deleted.length} row${r.deleted.length === 1 ? '' : 's'}`)
   },
+  get hasRowSelection() {
+    return !!(this.sel?.ranges?.length)
+  },
+  async duplicateRows() {
+    if (!this.canPersist()) return
+    if (!this.sel.ranges.length) return this.showToast('select one or more rows first')
+    const ids = await this.selectedRowIds()
+    if (!ids.length) return this.showToast('no rows selected')
+    const r = await (await fetch('/api/entities/duplicate', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ activity: this.actSlug, ids }),
+    })).json()
+    if (!r.ok) return this.showToast(r.error ?? 'could not duplicate rows')
+    await this.refreshWindow(false)
+    M.redraw()
+    const n = r.created?.length ?? 0
+    this.showToast(n === 1 ? `duplicated ${r.created[0].from} → ${r.created[0].id}` : `duplicated ${n} rows`)
+  },
 
   // ---- columns (toolbar) ----
+  // Visibility toggles flip `hidden` in the full ordered list (order preserved in activity YAML).
   async toggleFieldColumn(f) {
-    const columns = copyColumns(this.columns)
+    if (!this.canPersist()) return
+    const columns = copyColumns(this.fullColumns)
     const idx = columns.findIndex((c) => c.field === f)
-    if (idx >= 0) columns.splice(idx, 1)
+    if (idx >= 0) this.setColumnHidden(columns[idx], !columns[idx].hidden)
     else columns.push({ field: f })
     await this.patchColumns(columns)
   },
   hasFieldColumn(f) { return this.columns.some((c) => c.field === f) },
   async insertColumn() {
     const at = (this.sel.active?.c ?? this.columns.length - 1) + 1
-    const columns = copyColumns(this.columns)
-    columns.splice(at, 0, {})
+    const columns = copyColumns(this.fullColumns)
+    columns.splice(this.fullInsertIndex(at), 0, {})
     await this.patchColumns(columns)
   },
   async deleteColumn() {
@@ -1110,16 +1317,22 @@ function createApp() {
     if (ci == null) return this.showToast('select a cell in the column first')
     const col = this.columns[ci]
     if (col?.stage && !confirm(`Remove column ${colLetter(ci)}? Stage '${col.stage}' stays available for other activities.`)) return
-    const columns = copyColumns(this.columns)
-    columns.splice(ci, 1)
+    const columns = copyColumns(this.fullColumns)
+    const fi = this.fullIndexFromVisible(ci)
+    if (fi < 0) return
+    columns.splice(fi, 1)
     await this.patchColumns(columns)
   },
   async moveColumn(ci, delta) {
     const target = ci + delta
     if (target < 0 || target >= this.columns.length) return
-    const columns = copyColumns(this.columns)
-    const [column] = columns.splice(ci, 1)
-    columns.splice(target, 0, column)
+    const columns = copyColumns(this.fullColumns)
+    const from = this.fullIndexFromVisible(ci)
+    const to = this.fullIndexFromVisible(target)
+    if (from < 0 || to < 0) return
+    const [column] = columns.splice(from, 1)
+    // After removal, insert so the column lands at the target's slot among the full list.
+    columns.splice(to, 0, column)
     try {
       await this.patchColumns(columns)
       M.redraw()
@@ -1128,7 +1341,13 @@ function createApp() {
     }
   },
   async patchColumns(columns, componentLocks = this.componentLocks) {
-    const result = await this.persistActivity({ columns, componentLocks })
+    // Normalize: never persist hidden:false
+    const normalized = columns.map((c) => {
+      const next = { ...c }
+      if (!next.hidden) delete next.hidden
+      return next
+    })
+    const result = await this.persistActivity({ columns: normalized, componentLocks })
     if (!result) return false
     await this.loadMeta(false)
     this.redrawGrid()
@@ -1142,13 +1361,20 @@ function createApp() {
     if (!lock) {
       const snapshot = Object.fromEntries(group.fields.map((field) => [field.path, this.hasFieldColumn(field.path)]))
       const added = group.fields.filter((field) => !snapshot[field.path]).map((field) => field.path)
-      const columns = copyColumns(this.columns)
-      for (const path of added) columns.push({ field: path })
+      const columns = copyColumns(this.fullColumns)
+      for (const path of added) {
+        const existing = columns.find((c) => c.field === path)
+        if (existing) this.setColumnHidden(existing, false)
+        else columns.push({ field: path })
+      }
       const locks = { ...this.componentLocks, [group.component]: { snapshot, added } }
       await this.patchColumns(columns, locks)
     } else {
       const forced = new Set(lock.added)
-      const columns = this.columns.filter((column) => !forced.has(column.field))
+      const columns = copyColumns(this.fullColumns)
+      for (const c of columns) {
+        if (c.field && forced.has(c.field)) this.setColumnHidden(c, true)
+      }
       const locks = { ...this.componentLocks }
       delete locks[group.component]
       await this.patchColumns(columns, locks)
@@ -1159,11 +1385,47 @@ function createApp() {
   hasStageColumn(slug) { return this.columns.some((column) => column.stage === slug) },
   async toggleStageColumn(slug) {
     if (!this.canPersist()) return
-    const columns = copyColumns(this.columns)
+    const columns = copyColumns(this.fullColumns)
     const index = columns.findIndex((column) => column.stage === slug)
-    if (index >= 0) columns.splice(index, 1)
+    if (index >= 0) this.setColumnHidden(columns[index], !columns[index].hidden)
     else columns.push({ stage: slug })
     await this.patchColumns(columns)
+  },
+  // Column menu group bulk select: hide/show without dropping order from activity YAML.
+  async setStageColumnsVisible(show) {
+    if (!this.canPersist()) return
+    const stageSlugs = new Set((this.stageTree ?? []).map((s) => s.slug))
+    const columns = copyColumns(this.fullColumns)
+    for (const c of columns) {
+      if (c.stage && stageSlugs.has(c.stage)) this.setColumnHidden(c, !show)
+    }
+    if (show) {
+      for (const stage of this.stageTree ?? []) {
+        if (!columns.some((c) => c.stage === stage.slug)) columns.push({ stage: stage.slug })
+      }
+    }
+    await this.patchColumns(columns)
+    M.redraw()
+  },
+  async setFieldColumnsVisible(show) {
+    if (!this.canPersist()) return
+    const allPaths = []
+    for (const group of this.fieldTree ?? []) {
+      for (const field of group.fields ?? []) allPaths.push(field.path)
+    }
+    const pathSet = new Set(allPaths)
+    const columns = copyColumns(this.fullColumns)
+    for (const c of columns) {
+      if (c.field && pathSet.has(c.field)) this.setColumnHidden(c, !show)
+    }
+    if (show) {
+      for (const path of allPaths) {
+        if (!columns.some((c) => c.field === path)) columns.push({ field: path })
+      }
+    }
+    // Clear component locks so individual field checkboxes stay interactive.
+    await this.patchColumns(columns, {})
+    M.redraw()
   },
   startFieldColumnEdit(ci) {
     const field = this.columns[ci]?.field
@@ -1189,9 +1451,14 @@ function createApp() {
     const field = edit.value.trim()
     if (field === this.columns[edit.ci]?.field) return
     if (!/^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)+$/.test(field)) return this.showToast('field path must be component.field')
-    const columns = copyColumns(this.columns)
-    const prev = columns[edit.ci] ?? {}
-    columns[edit.ci] = prev.width != null ? { field, width: prev.width } : { field }
+    const columns = copyColumns(this.fullColumns)
+    const fi = this.fullIndexFromVisible(edit.ci)
+    if (fi < 0) return
+    const prev = columns[fi] ?? {}
+    const next = { field }
+    if (prev.width != null) next.width = prev.width
+    if (prev.hidden) next.hidden = true
+    columns[fi] = next
     if (!await this.patchColumns(columns)) return
     this.filterMenu = null
     this.sort = null
@@ -1252,9 +1519,16 @@ function createApp() {
     if (!this.canPersist()) return
     const activity = this.meta?.activities?.find((entry) => entry.slug === slug)
     if (!activity || !confirm(`Delete activity '${activity.title}' and its activity YAML file?`)) return
-    const response = await fetch(`/api/activity/${encodeURIComponent(slug)}?revision=${this.act?.revision ?? 0}`, { method: 'DELETE' })
-    const result = await response.json()
-    if (response.status === 409) return this.markDesync()
+    // Optimistic concurrency must use the target tab's revision, not the active tab's.
+    const response = await fetch(
+      `/api/activity/${encodeURIComponent(slug)}?revision=${activity.revision ?? 0}`,
+      { method: 'DELETE' },
+    )
+    const result = await response.json().catch(() => ({}))
+    if (response.status === 409) {
+      this.markDesync()
+      return this.showToast(result.error ?? 'activity changed on disk — reload and try again')
+    }
     if (!response.ok || !result.ok) return this.showToast(result.error ?? 'could not delete activity')
     this.tabMenu = null
     if (this.actSlug === slug) {
@@ -1930,29 +2204,71 @@ function createApp() {
         <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : '')" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : 'disconnected from sheets server')" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span><button class="refresh-button" @click="refreshPersistent()" title="reload persistent files">↻</button>
         <span x-text="meta ? meta.root.split('/').pop() : ''" style="color:var(--dim)"></span>
         <div class="dropdown" @click.outside="fieldMenu = false">
-          <button class="toolbar-icon-btn toolbar-dropdown-btn" @click="fieldMenu = !fieldMenu" title="columns">
+          <button class="toolbar-icon-btn toolbar-dropdown-btn" @click="toggleFieldMenu()" title="columns">
             <i class="ph-bold ph-table" aria-hidden="true"></i>
             <i class="ph-fill ph-caret-down toolbar-dropdown-caret" aria-hidden="true"></i>
           </button>
           <div class="menu" x-show="fieldMenu">
-            <div class="column-group-heading">Stages</div>
-            <label class="stage-toggle" x-for="stage in stageTree" :key="stage.slug">
-              <input type="checkbox" :checked="hasStageColumn(stage.slug)" @change="toggleStageColumn(stage.slug)">
-              <span x-text="stage.title"></span>
-            </label>
-            <div class="column-group-heading">Component fields</div>
+            <div class="column-group-heading">
+              <span>Stages</span>
+              <span class="column-group-bulk">
+                <button type="button" class="bulk-link" @click.stop="setStageColumnsVisible(true)" title="show all stages">all</button>
+                <button type="button" class="bulk-link" @click.stop="setStageColumnsVisible(false)" title="hide all stages">none</button>
+              </span>
+            </div>
+            <div class="stage-toggle" x-for="stage in stageTree" :key="stage.slug">
+              <label class="col-menu-main">
+                <input type="checkbox" :checked="hasStageColumn(stage.slug)" @change="toggleStageColumn(stage.slug)">
+                <span class="col-menu-label" x-text="stage.title"></span>
+              </label>
+              <span class="col-menu-actions">
+                <button type="button" class="col-menu-btn danger" title="delete stage from disk"
+                  @click.stop="deleteStageFile(stage)">
+                  <i class="ph-bold ph-trash" aria-hidden="true"></i>
+                </button>
+              </span>
+            </div>
+            <div class="column-group-heading">
+              <span>Component fields</span>
+              <span class="column-group-bulk">
+                <button type="button" class="bulk-link" @click.stop="setFieldColumnsVisible(true)" title="show all fields">all</button>
+                <button type="button" class="bulk-link" @click.stop="setFieldColumnsVisible(false)" title="hide all fields">none</button>
+              </span>
+            </div>
             <div class="component-group" x-for="group in fieldTree" :key="group.component">
               <label class="component-toggle">
                 <input type="checkbox" :checked="componentLocked(group.component)" @change="toggleComponent(group)">
                 <span x-text="group.component"></span>
               </label>
-              <label class="field-toggle" x-for="field in group.fields" :key="field.path">
-                <input type="checkbox" :checked="hasFieldColumn(field.path)" :disabled="componentLocked(group.component)"
-                  @change="toggleFieldPath(field.path)">
-                <span x-text="field.name"></span>
-              </label>
+              <div class="field-toggle" x-for="field in group.fields" :key="field.path">
+                <label class="col-menu-main">
+                  <input type="checkbox" :checked="hasFieldColumn(field.path)" :disabled="componentLocked(group.component)"
+                    @change="toggleFieldPath(field.path)">
+                  <span class="col-menu-label" :class="field.inSchema ? 'in-schema' : 'undeclared'" x-text="field.name"></span>
+                </label>
+                <span class="col-menu-actions">
+                  <button type="button" class="col-menu-btn" :class="field.inSchema ? 'on' : ''"
+                    :title="field.inSchema ? 'remove from schema.yaml' : 'add to schema.yaml'"
+                    @click.stop="toggleSchemaField(field)">
+                    <i class="ph-bold" :class="field.inSchema ? 'ph-check-square' : 'ph-square'" aria-hidden="true"></i>
+                  </button>
+                  <button type="button" class="col-menu-btn danger" title="delete field from all entities"
+                    @click.stop="deleteFieldEverywhere(field)">
+                    <i class="ph-bold ph-trash" aria-hidden="true"></i>
+                  </button>
+                </span>
+              </div>
             </div>
           </div>
+        </div>
+        <div class="toolbar-group" title="columns">
+          <span class="toolbar-group-label" aria-hidden="true"><i class="ph-bold ph-columns"></i></span>
+          <button class="toolbar-icon-btn" @click="insertColumn()" title="insert stage column after cursor">
+            <i class="ph-bold ph-plus-circle" aria-hidden="true"></i>
+          </button>
+          <button class="toolbar-icon-btn" @click="deleteColumn()" title="delete column at cursor">
+            <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
+          </button>
         </div>
         <div class="toolbar-group" title="rows">
           <span class="toolbar-group-label" aria-hidden="true"><i class="ph-bold ph-rows"></i></span>
@@ -1962,14 +2278,9 @@ function createApp() {
           <button class="toolbar-icon-btn" @click="deleteRows()" title="delete rows included in the selection">
             <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
           </button>
-        </div>
-        <div class="toolbar-group" title="columns">
-          <span class="toolbar-group-label" aria-hidden="true"><i class="ph-bold ph-columns"></i></span>
-          <button class="toolbar-icon-btn" @click="insertColumn()" title="insert stage column after cursor">
-            <i class="ph-bold ph-plus-circle" aria-hidden="true"></i>
-          </button>
-          <button class="toolbar-icon-btn" @click="deleteColumn()" title="delete column at cursor">
-            <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
+          <button class="toolbar-icon-btn" @click="duplicateRows()" title="Duplicate row"
+            :disabled="!hasRowSelection">
+            <i class="ph-bold ph-copy" aria-hidden="true"></i>
           </button>
         </div>
         <div class="search-wrap" :class="(searchDraft ? 'on ' : '') + (searchDraft ? 'has-clear' : '')"
@@ -1984,10 +2295,12 @@ function createApp() {
             <i class="ph-bold ph-x" aria-hidden="true"></i>
           </button>
         </div>
-        <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection">
-          <i class="ph-bold ph-play" aria-hidden="true"></i>
-        </button>
-        <span class="entity-count" x-text="entityCountLabel"></span>
+        <div class="toolbar-end">
+          <span class="play-summary" x-text="playSummaryLabel"></span>
+          <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection">
+            <i class="ph-bold ph-play" aria-hidden="true"></i>
+          </button>
+        </div>
       </div>
 
       <div class="focus" x-show="focus">
@@ -2057,8 +2370,8 @@ function createApp() {
                       @keydown="if ($event.key === 'Enter') magicSubmit(ci)">
                   </template>
                   <span class="actions">
-                    <button class="col-move" title="move column left" :disabled="ci === 0" @click.stop="moveColumn(ci, -1)">‹</button>
-                    <button class="col-move" title="move column right" :disabled="ci === columns.length - 1" @click.stop="moveColumn(ci, 1)">›</button>
+                    <button class="col-move" title="move column left" x-show="ci > 0" @click.stop="moveColumn(ci, -1)">‹</button>
+                    <button class="col-move" title="move column right" x-show="ci < columns.length - 1" @click.stop="moveColumn(ci, 1)">›</button>
                     <button class="filter-btn"
                       :class="(columnHasFilter(ci) || (sort && sort.ci === ci) ? 'on ' : '') + (columnHasFilter(ci) || (sort && sort.ci === ci) || (filterMenu && filterMenu.ci === ci) ? 'force-show' : '')"
                       title="sort / filter column" @click.stop="openFilterMenu(ci, $event)">

@@ -295,9 +295,15 @@ cmdLs = (ws, args) ->
   meta = await api base, '/api/meta'
   for a in meta.activities
     process.stdout.write "#{a.slug}  (#{a.title})  #{a.source}\n"
-    for c, i in a.columns
-      kind = if c.stage? then "stage:#{c.stage}" else "field:#{c.field}"
-      process.stdout.write "  #{String.fromCharCode 65 + i}  #{kind}\n"
+    vi = 0
+    for c in a.columns
+      kind = if c.stage? then "stage:#{c.stage}" else if c.field? then "field:#{c.field}" else "(empty)"
+      if c.hidden
+        process.stdout.write "  ·  #{kind}  (hidden)\n"
+      else
+        letter = if vi < 26 then String.fromCharCode(65 + vi) else String(vi)
+        process.stdout.write "  #{letter}  #{kind}\n"
+        vi++
 
 cmdCat = (ws, args) ->
   base = serverUrl ws, args

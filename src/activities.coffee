@@ -2,6 +2,8 @@
 # one sheets process manages many databases (§3). Columns: {field: 'comp.field'} (default
 # stage, not playable) or {stage: '<slug>'} (scripted stage in .sheets/stages/).
 # Optional per-column `width` (px) is UI layout only and round-trips through activity YAML.
+# Optional `hidden: true` keeps the column in order while omitting it from the grid —
+# so show/hide (all|none, checkboxes) does not scramble ordering.
 import fs from 'node:fs'
 import path from 'node:path'
 import yaml from 'js-yaml'

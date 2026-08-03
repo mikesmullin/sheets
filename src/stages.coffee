@@ -29,6 +29,13 @@ export class Stages
     fs.renameSync "#{f}.tmp~", f
     @invalidate slug
 
+  remove: (slug) ->
+    f = @file slug
+    return false unless fs.existsSync f
+    fs.rmSync f, force: true
+    @invalidate slug
+    true
+
   invalidate: (slug) -> @cache.delete slug
 
   # Compile never throws — bad Angela-authored Coffee must not crash the server.

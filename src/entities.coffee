@@ -99,26 +99,130 @@ export displayFieldsFor = (dbDir) ->
       null
   out
 
+# Locate schema.yaml / schema.yml under a db dir (entity source).
+export schemaFileFor = (dbDir) ->
+  for f in ['schema.yaml', 'schema.yml']
+    p = path.join dbDir, f
+    return p if fs.existsSync p
+  path.join dbDir, 'schema.yaml'
+
+export readSchemaDoc = (dbDir) ->
+  file = schemaFileFor dbDir
+  return { file, doc: {}, exists: false } unless fs.existsSync file
+  try
+    doc = yaml.load(fs.readFileSync(file, 'utf8')) ? {}
+  catch
+    doc = {}
+  doc = {} unless doc? and typeof doc is 'object' and not Array.isArray doc
+  { file, doc, exists: true }
+
+export writeSchemaDoc = (dbDir, doc) ->
+  file = schemaFileFor dbDir
+  fs.mkdirSync path.dirname(file), recursive: true
+  tmp = "#{file}.tmp~"
+  fs.writeFileSync tmp, yaml.dump(doc ? {})
+  fs.renameSync tmp, file
+  file
+
 # Schema field groups for the column picker. A schema may declare either
 # `components: { component: { fields: { field: ... } } }` or a direct field map.
 export componentFieldsFor = (dbDir) ->
-  for f in ['schema.yaml', 'schema.yml']
-    p = path.join dbDir, f
-    continue unless fs.existsSync p
-    try
-      doc = yaml.load(fs.readFileSync(p, 'utf8')) ? {}
-      components = doc.schema?.components ? doc.components ? null
-      continue unless components? and typeof components is 'object'
-      out = []
-      for component, definition of components
-        source = definition?.fields ? definition
-        names = if Array.isArray(source) then source else Object.keys(source ? {})
-        fields = (String(name) for name in names when String(name).trim())
-        out.push { component: String(component), fields } if fields.length
-      return out
-    catch
-      null
-  []
+  { doc, exists } = readSchemaDoc dbDir
+  return [] unless exists
+  components = doc.schema?.components ? doc.components ? null
+  return [] unless components? and typeof components is 'object'
+  out = []
+  for component, definition of components
+    source = definition?.fields ? definition
+    names = if Array.isArray(source) then source else Object.keys(source ? {})
+    fields = (String(name) for name in names when String(name).trim())
+    out.push { component: String(component), fields } if fields.length
+  out
+
+# True if component.field is declared in schema.yaml.
+export schemaHasField = (dbDir, component, field) ->
+  { doc, exists } = readSchemaDoc dbDir
+  return false unless exists
+  components = doc.schema?.components ? doc.components ? null
+  return false unless components?[component]?
+  definition = components[component]
+  source = definition?.fields ? definition
+  return source.includes(field) if Array.isArray source
+  return Object.prototype.hasOwnProperty.call(source ? {}, field)
+
+# Guess a simple scalar type from non-null sample values.
+export guessFieldType = (values) ->
+  samples = (v for v in values when v? and v isnt '')
+  return 'string' unless samples.length
+  if samples.every((v) -> typeof v is 'boolean' or v is true or v is false or v is 'true' or v is 'false')
+    return 'boolean'
+  if samples.every((v) -> typeof v is 'number' or (typeof v is 'string' and v.trim() isnt '' and Number.isFinite(Number(v))))
+    return 'number'
+  if samples.every((v) -> Array.isArray v)
+    return 'array'
+  if samples.every((v) -> v? and typeof v is 'object' and not Array.isArray(v))
+    return 'object'
+  'string'
+
+# Normalize a component definition to `{ fields: { name: { type } } }`.
+normalizeComponentDef = (def) ->
+  if Array.isArray def
+    map = {}
+    map[String(n)] = { type: 'string' } for n in def when String(n).trim()
+    return { fields: map }
+  def = {} unless def? and typeof def is 'object' and not Array.isArray def
+  if def.fields?
+    if Array.isArray def.fields
+      map = {}
+      map[String(n)] = { type: 'string' } for n in def.fields when String(n).trim()
+      def.fields = map
+    else if typeof def.fields is 'object'
+      for k, v of def.fields
+        def.fields[k] = if v? and typeof v is 'object' and not Array.isArray(v) then v else { type: String(v ? 'string') }
+    else
+      def.fields = {}
+  else
+    # Flat map: { name: { type } } or { name: 'string' }
+    map = {}
+    for k, v of def
+      map[k] = if v? and typeof v is 'object' and not Array.isArray(v) then v else { type: String(v ? 'string') }
+    def = { fields: map }
+  def.fields ?= {}
+  def
+
+# Add or remove a field declaration under components.<component>.fields.
+# `type` is used when adding; ignored when removing.
+export mutateSchemaField = (dbDir, component, field, action, type = 'string') ->
+  { file, doc } = readSchemaDoc dbDir
+  # Prefer existing components location (top-level or schema.components).
+  holder = if doc.components? then doc else if doc.schema?.components? then doc.schema else doc
+  holder.components ?= {}
+  def = normalizeComponentDef holder.components[component]
+  holder.components[component] = def
+  if action is 'add'
+    def.fields[field] = { type: type or 'string' }
+  else if action is 'remove'
+    delete def.fields[field]
+    delete holder.components[component] if Object.keys(def.fields).length is 0
+  else
+    throw new Error "unknown schema action: #{action}"
+  written = writeSchemaDoc dbDir, doc
+  { file: written, component, field, action, type: def.fields[field]?.type ? null }
+
+# Delete component.field from every entity YAML under dbDir. Returns count of files changed.
+export deleteFieldFromAll = (dbDir, component, field) ->
+  changed = 0
+  for file in walkDb dbDir
+    { doc, body } = readEntityFile file
+    continue unless doc?[component]? and typeof doc[component] is 'object' and not Array.isArray(doc[component])
+    continue unless Object.prototype.hasOwnProperty.call doc[component], field
+    delete doc[component][field]
+    # Drop empty component object
+    keys = Object.keys doc[component]
+    delete doc[component] if keys.length is 0
+    writeEntityFile file, doc, body
+    changed++
+  changed
 
 export labelFor = (id, doc, displayFields) ->
   cls = id.split('/')[0]

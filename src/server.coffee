@@ -38,6 +38,16 @@ nextEntityId = (source) ->
     return id unless E.fileFor source, id
     n++
 
+# apple -> apple1, apple2, … (digit suffix until the path is free).
+uniqueCopyId = (source, id) ->
+  base = String(id ? '').replace /\/+$/, ''
+  n = 1
+  loop
+    candidate = validEntityId "#{base}#{n}"
+    return null unless candidate
+    return candidate unless E.fileFor source, candidate
+    n++
+
 # Prefer meaningful short slugs over the first 40 chars of a long sentence
 # ("based-on-the-color-of-the-fruit-and-the-" was useless).
 STOP_WORDS = new Set [
@@ -168,6 +178,16 @@ export startServer = (opts = {}) ->
   resolveActivity = (slug) ->
     a = activities.get slug
     a ? (activities.list()[0] ? { slug: null, source: ws.db, columns: [] })
+
+  # Grid / A1 indices use visible columns only; activity YAML keeps full order + hidden.
+  visibleColumns = (cols) -> (c for c in (cols ? []) when not c.hidden)
+  fullIndexFromVisible = (cols, vi) ->
+    v = 0
+    for c, i in (cols ? [])
+      continue if c.hidden
+      return i if v is vi
+      v++
+    -1
 
   displayCache = new Map()
   displayFields = (source) ->
@@ -373,17 +393,89 @@ export startServer = (opts = {}) ->
 
     if p is '/api/fields'
       a = resolveActivity url.searchParams.get('activity')
-      fields = await store.fieldPaths a.source
-      schema = E.componentFieldsFor a.source
-      components = if schema.length then schema else do ->
-        grouped = new Map()
-        for field in fields
-          [component, ...rest] = field.split '.'
-          continue unless component and rest.length
-          grouped.set(component, []) unless grouped.has component
-          grouped.get(component).push rest.join '.'
-        ({ component, fields: names } for [component, names] from grouped)
-      return json { fields, components, schema: schema.length > 0 }
+      discovered = await store.fieldPaths a.source
+      schemaGroups = E.componentFieldsFor a.source
+      # Union schema + discovered fields; alphabetically ordered; mark inSchema.
+      byComp = new Map()
+      for group in schemaGroups
+        set = byComp.get(group.component) ? new Set()
+        set.add name for name in group.fields
+        byComp.set group.component, set
+      for field in discovered
+        [component, ...rest] = field.split '.'
+        continue unless component and rest.length
+        name = rest.join '.'
+        set = byComp.get(component) ? new Set()
+        set.add name
+        byComp.set component, set
+      components = []
+      for component in Array.from(byComp.keys()).sort()
+        names = Array.from(byComp.get(component)).sort()
+        fields = for name in names
+          {
+            name
+            path: "#{component}.#{name}"
+            inSchema: E.schemaHasField a.source, component, name
+          }
+        components.push { component, fields }
+      return json {
+        fields: discovered
+        components
+        schema: schemaGroups.length > 0
+      }
+
+    # Toggle a field in schema.yaml (add with guessed type, or remove).
+    if p is '/api/fields/schema' and req.method is 'POST'
+      body = await req.json()
+      a = resolveActivity body.activity
+      pathDot = String(body.field ? '')
+      [component, ...rest] = pathDot.split '.'
+      field = rest.join '.'
+      return json { error: 'field must be component.field' }, 400 unless component and field
+      action = String(body.action ? '')
+      return json { error: "action must be 'add' or 'remove'" }, 400 unless action in ['add', 'remove']
+      type = 'string'
+      if action is 'add'
+        samples = await store.fieldSamples a.source, component, field
+        type = E.guessFieldType samples
+      try
+        result = E.mutateSchemaField a.source, component, field, action, type
+      catch err
+        return json { error: String(err?.message ? err) }, 400
+      persisted 'schema', { source: a.source }
+      return json { ok: true, ...result }
+
+    # Delete component.field from every entity file in the activity source.
+    if p is '/api/fields/delete' and req.method is 'POST'
+      body = await req.json()
+      a = resolveActivity body.activity
+      pathDot = String(body.field ? '')
+      [component, ...rest] = pathDot.split '.'
+      field = rest.join '.'
+      return json { error: 'field must be component.field' }, 400 unless component and field
+      changed = E.deleteFieldFromAll a.source, component, field
+      # Refresh store for all changed entities (reload source is simplest).
+      await store.loadSource a.source
+      persisted 'entity', { source: a.source, id: '*' }
+      return json { ok: true, field: pathDot, changed }
+
+    # Delete a stage .coffee from disk and drop it from all activity columns.
+    if p is '/api/stage/delete' and req.method is 'POST'
+      body = await req.json()
+      slug = String(body.slug ? body.stage ? '').trim()
+      return json { error: 'stage slug required' }, 400 unless slug
+      return json { error: "stage not found: #{slug}" }, 404 unless stages.exists slug
+      stages.remove slug
+      # Strip from every activity column list.
+      for act in activities.list()
+        has = (act.columns ? []).some (c) -> c.stage is slug
+        continue unless has
+        activities.update act.slug, (doc) ->
+          doc.columns = (c for c in (doc.columns ? []) when c.stage isnt slug)
+          doc.revision = Number(doc.revision ? 0) + 1
+        persisted 'activity', { slug: act.slug }
+      persisted 'stage', { slug }
+      return json { ok: true, slug }
 
     if p is '/api/entities' and req.method is 'POST'
       body = await req.json()
@@ -416,6 +508,41 @@ export startServer = (opts = {}) ->
         persisted 'entity', { source: a.source, id }
       return json { ok: true, deleted: (entry.id for entry in files) }
 
+    # Duplicate selected entities: copy YAML (and .md body) to a free id with a digit suffix.
+    if p is '/api/entities/duplicate' and req.method is 'POST'
+      body = await req.json()
+      a = resolveActivity body.activity
+      # Preserve request order (selection order); de-dupe while keeping first occurrence.
+      seen = new Set()
+      ids = []
+      for raw in (body.ids ? [])
+        id = validEntityId raw
+        continue unless id
+        continue if seen.has id
+        seen.add id
+        ids.push id
+      return json { error: 'no valid entity ids supplied' }, 400 unless ids.length
+      created = []
+      for id in ids
+        file = E.fileFor a.source, id
+        return json { error: "not found: #{id}" }, 404 unless file
+        nextId = uniqueCopyId a.source, id
+        return json { error: "could not allocate unique id for #{id}" }, 500 unless nextId
+        { doc, body: mdBody } = E.readEntityFile file
+        copy = structuredClone doc
+        ext = path.extname file
+        target = path.join a.source, nextId + ext
+        sourceRoot = path.resolve(a.source) + path.sep
+        return json { error: 'invalid entity id' }, 400 unless path.resolve(target).startsWith(sourceRoot) or path.resolve(target) is path.resolve(a.source)
+        # nested class ids may need parent dirs
+        fs.mkdirSync path.dirname(target), recursive: true
+        E.writeEntityFile target, copy, mdBody
+        await store.upsert a.source, nextId, copy, fs.statSync(target).mtimeMs
+        persisted 'entity', { source: a.source, id: nextId }
+        created.push { id: nextId, from: id, file: target }
+      return json { ok: true, created }
+
+    # DELETE-key clear: drop keys from entity YAML (not null). Empty components removed.
     if p is '/api/entities/blank' and req.method is 'POST'
       body = await req.json()
       a = resolveActivity body.activity
@@ -431,10 +558,14 @@ export startServer = (opts = {}) ->
           [component, ...rest] = String(dotPath).split '.'
           field = rest.join '.'
           continue unless component and field
-          doc[component] ?= {}
-          doc[component][field] = null
+          continue unless doc?[component]? and typeof doc[component] is 'object' and not Array.isArray(doc[component])
+          continue unless Object.prototype.hasOwnProperty.call doc[component], field
+          delete doc[component][field]
           changed = true
           blanked++
+          # Drop empty component objects so YAML stays tidy.
+          if Object.keys(doc[component]).length is 0
+            delete doc[component]
         continue unless changed
         E.writeEntityFile file, doc, mdBody
         await store.upsert a.source, item.id, doc, fs.statSync(file).mtimeMs
@@ -502,14 +633,17 @@ export startServer = (opts = {}) ->
       if body.revision? and Number(body.revision) isnt Number(a.revision ? 0)
         return json { error: 'activity revision conflict', revision: a.revision }, 409
       ci = Number body.column
-      return json { error: 'select an empty column first' }, 400 unless Number.isInteger(ci) and a.columns[ci]? and not a.columns[ci].stage? and not a.columns[ci].field?
+      fi = fullIndexFromVisible a.columns, ci
+      col = if fi >= 0 then a.columns[fi] else null
+      return json { error: 'select an empty column first' }, 400 unless Number.isInteger(ci) and col? and not col.stage? and not col.field?
       slug = promptStageSlug prompt, stages
       activities.update a.slug, (doc) ->
         doc.columns ?= []
-        prev = doc.columns[ci] ? {}
+        prev = doc.columns[fi] ? {}
         next = { stage: slug }
         next.width = prev.width if prev.width?
-        doc.columns[ci] = next
+        # Authoring a stage always shows the column.
+        doc.columns[fi] = next
         doc.revision = Number(doc.revision ? 0) + 1
       persisted 'activity', { slug: a.slug }
       return json { ok: true, slug, authored: false }
@@ -541,7 +675,7 @@ export startServer = (opts = {}) ->
       a = resolveActivity body.activity
       ranges = A1.parseRange body.range ? ''
       ids = await orderedIds a
-      { cells, skipped } = A1.resolveCells ranges, a.columns, ids
+      { cells, skipped } = A1.resolveCells ranges, visibleColumns(a.columns), ids
       added = engine.enqueue ({ source: a.source, id: c.id, stage: c.stage } for c in cells)
       return json { ok: true, added, skipped, resolved: cells.length }
 
@@ -580,12 +714,13 @@ export startServer = (opts = {}) ->
       a = resolveActivity body.activity
       ranges = A1.parseRange body.a1 ? ''
       ids = await orderedIds a
+      vcols = visibleColumns a.columns
       out = []
       for r in ranges
-        cols = r.cols ? [0...a.columns.length]
+        cols = r.cols ? [0...vcols.length]
         rows = r.rows ? null
-        for ci in cols when ci < a.columns.length
-          col = a.columns[ci]
+        for ci in cols when ci < vcols.length
+          col = vcols[ci]
           entry = { col: A1.indexToCol(ci), stage: col.stage ? null, field: col.field ? null }
           entry.ids = (ids[ri] for ri in (rows ? []) when ri < ids.length) if rows?
           out.push entry

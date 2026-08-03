@@ -110,8 +110,9 @@ export class Store
     r = await @db.query "SELECT id FROM entities WHERE source = $1 ORDER BY id #{dirSql}", [source]
     (row.id for row in r.rows)
 
-  # union of component.field dot-paths across a sample of docs (column picker)
-  fieldPaths: (source, sample = 500) ->
+  # union of component.field dot-paths across docs (column picker).
+  # Default sample is large so undeclared fields on late rows still appear.
+  fieldPaths: (source, sample = 100000) ->
     r = await @db.query "SELECT doc FROM entities WHERE source = $1 LIMIT $2", [source, sample]
     seen = new Set()
     for row in r.rows
@@ -121,5 +122,14 @@ export class Store
         else
           seen.add comp
     Array.from(seen).sort()
+
+  # Collect non-null sample values for component.field (type guessing).
+  fieldSamples: (source, component, field, limit = 200) ->
+    r = await @db.query "SELECT doc FROM entities WHERE source = $1 LIMIT $2", [source, limit]
+    out = []
+    for row in r.rows
+      v = row.doc?[component]?[field]
+      out.push v if v?
+    out
 
   close: -> await @db?.close()
