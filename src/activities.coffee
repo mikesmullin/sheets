@@ -1,6 +1,7 @@
 # Activities = worksheet tabs: named, ordered column lists, each with its own rows.source —
 # one sheets process manages many databases (§3). Columns: {field: 'comp.field'} (default
 # stage, not playable) or {stage: '<slug>'} (scripted stage in .sheets/stages/).
+# Optional per-column `width` (px) is UI layout only and round-trips through activity YAML.
 import fs from 'node:fs'
 import path from 'node:path'
 import yaml from 'js-yaml'

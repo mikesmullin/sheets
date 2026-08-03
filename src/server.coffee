@@ -37,73 +37,32 @@ nextEntityId = (source) ->
     return id unless E.fileFor source, id
     n++
 
-isFruitEaterPrompt = (prompt) ->
-  /animal/i.test(prompt) and /fruit/i.test(prompt) and /(eat|eats|eating|likes)/i.test(prompt)
-
-fruitEaterStage = (prompt) ->
-  """
-# Authored by Angela's local fruit-eater template. It is deterministic so the example works
-# without requiring a tool-call-capable model provider.
-export meta =
-  title: 'Fruit eater'
-  prompt: #{JSON.stringify prompt}
-  writes: ['animal.name']
-
-export gate = (entity) ->
-  entity.produce?.name?
-
-animals =
-  apple: 'Black bear'
-  crabapple: 'Black bear'
-  apricot: 'Ring-tailed lemur'
-  banana: 'Capuchin monkey'
-  blackberry: 'Red fox'
-  blueberry: 'American robin'
-  cantaloupe: 'Raccoon'
-  cherry: 'Cedar waxwing'
-  clementine: 'Orangutan'
-  coconut: 'Coconut crab'
-  cranberry: 'Wild turkey'
-  date: 'Dromedary camel'
-  dragonfruit: 'Fruit bat'
-  durian: 'Asian elephant'
-  fig: 'Fig parrot'
-  grape: 'European starling'
-  grapefruit: 'Kinkajou'
-  guava: 'Green iguana'
-  honeydew: 'Brown bear'
-  jackfruit: 'Asian elephant'
-  kiwi: 'Common brushtail possum'
-  lemon: 'Vervet monkey'
-  lime: 'Green iguana'
-  lychee: 'Flying fox'
-  mango: 'Indian flying fox'
-  orange: 'Orangutan'
-  papaya: 'Toucan'
-  peach: 'White-tailed deer'
-  pear: 'Black bear'
-  pineapple: 'Coati'
-  pomegranate: 'House sparrow'
-  raspberry: 'Red fox'
-  strawberry: 'Eastern cottontail'
-  watermelon: 'Striped skunk'
-
-export reduce = (entity, ctx) ->
-  fruit = String(entity.produce.name).toLowerCase()
-  animal = animals[fruit] ? 'Fruit bat'
-  ctx.log fruit + ' → ' + animal
-  animal: name: animal
-
-esc = (s) -> String(s ? '').replace /[&<>"']/g, (c) -> '&#' + c.charCodeAt(0) + ';'
-wiki = (name) -> 'https://en.wikipedia.org/wiki/' + encodeURIComponent(name.replace /\s+/g, '_')
-
-export views =
-  cell: (entity) ->
-    animal = entity.animal?.name ? ''
-    return template: '<span style="color:#8b8f99">—</span>' unless animal
-    url = wiki animal
-    template: '<a class="animal-link" href="' + esc(url) + '" target="_blank" rel="noreferrer">' + esc(animal) + '</a>'
-"""
+# Prefer meaningful short slugs over the first 40 chars of a long sentence
+# ("based-on-the-color-of-the-fruit-and-the-" was useless).
+STOP_WORDS = new Set [
+  'a','an','the','of','and','or','to','for','in','on','at','by','with','from','as','is','are'
+  'be','this','that','it','its','into','than','then','than','while','would','should','could'
+  'based','using','use','make','made','does','do','did','will','can','about','what','which'
+  'when','where','how','who','whom','their','them','they','you','your','our','my','me','i'
+]
+promptStageSlug = (prompt, stages) ->
+  words = String(prompt ? '').toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .split(/\s+/)
+    .filter (w) -> w.length > 1 and not STOP_WORDS.has w
+  # de-dupe while preserving order
+  seen = new Set()
+  uniq = []
+  for w in words when not seen.has w
+    seen.add w
+    uniq.push w
+  base = (uniq.slice(0, 5).join('-') or 'stage').slice(0, 48).replace(/^-+|-+$/g, '') or 'stage'
+  slug = base
+  n = 2
+  while stages.exists slug
+    slug = "#{base}-#{n}"
+    n++
+  slug
 
 export startServer = (opts = {}) ->
   ws = CFG.resolveWorkspace opts
@@ -218,6 +177,16 @@ export startServer = (opts = {}) ->
     if p.startsWith '/api/chat'
       r = await chat.handle req, url
       return r if r?
+
+    if p is '/speak' and req.method is 'GET'
+      text = String(url.searchParams.get('text') ? '').slice 0, 4000
+      return json { error: 'no text' }, 400 unless text.trim()
+      return json { error: 'ada_not_installed' }, 501 unless Bun.which 'ada'
+      try
+        Bun.spawn ['ada', 'voice', text], stdout: 'ignore', stderr: 'ignore'
+        return json { ok: true }
+      catch err
+        return json { error: "ada_failed: #{err.message}" }, 500
 
     # ---- api ----
     if p is '/api/meta'
@@ -382,28 +351,22 @@ export startServer = (opts = {}) ->
     if p is '/api/stage/from-prompt' and req.method is 'POST'
       body = await req.json()
       prompt = String(body.prompt ? '').trim()
-      return json { error: 'no local stage template matches this prompt' }, 422 unless isFruitEaterPrompt prompt
+      return json { error: 'prompt is required' }, 400 unless prompt
       a = resolveActivity body.activity
       if body.revision? and Number(body.revision) isnt Number(a.revision ? 0)
         return json { error: 'activity revision conflict', revision: a.revision }, 409
       ci = Number body.column
       return json { error: 'select an empty column first' }, 400 unless Number.isInteger(ci) and a.columns[ci]? and not a.columns[ci].stage? and not a.columns[ci].field?
-      slug = 'fruit-eater'
-      n = 2
-      while stages.exists slug
-        slug = "fruit-eater-#{n}"
-        n++
-      stages.write slug, fruitEaterStage(prompt)
+      slug = promptStageSlug prompt, stages
       activities.update a.slug, (doc) ->
         doc.columns ?= []
-        doc.columns[ci] = { stage: slug }
+        prev = doc.columns[ci] ? {}
+        next = { stage: slug }
+        next.width = prev.width if prev.width?
+        doc.columns[ci] = next
         doc.revision = Number(doc.revision ? 0) + 1
-      persisted 'stage', { slug }
       persisted 'activity', { slug: a.slug }
-      return json {
-        ok: true, slug
-        summary: "I created the #{slug} stage. It writes animal.name and renders each result as a Wikipedia link."
-      }
+      return json { ok: true, slug, authored: false }
 
     if m = p.match /^\/api\/stage\/([\w-]+)\/views\.js$/
       js = stages.js m[1]
@@ -461,7 +424,7 @@ export startServer = (opts = {}) ->
       body = await req.json()
       a = resolveActivity body.activity
       try
-        results = await engine.dryRun a.source, body.stage, (body.ids ? [])
+        results = await engine.dryRun a.source, body.stage, (body.ids ? []), { signal: req.signal }
         return json { ok: true, results }
       catch err
         return json { ok: false, error: String(err?.message ? err) }, 400

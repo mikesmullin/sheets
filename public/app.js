@@ -5,12 +5,27 @@
 import M from './m.js'
 
 const ROWH = 28
+const MIN_ROW_HEIGHT = 22
+const MAX_ROW_HEIGHT = 480
+const DEFAULT_COL_WIDTH = 180
+const MIN_COL_WIDTH = 60
+const MAX_COL_WIDTH = 960
+const normalizeRowHeight = (height) => {
+  const n = Math.round(Number(height))
+  if (!Number.isFinite(n)) return ROWH
+  return Math.max(MIN_ROW_HEIGHT, Math.min(MAX_ROW_HEIGHT, n))
+}
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 const colLetter = (i) => { let s = '', n = i + 1; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26 } return s }
 const hashColor = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return `hsl(${Math.abs(h) % 360},55%,62%)` }
 const getPath = (doc, p) => { let c = doc; for (const k of String(p).split('.')) { if (c == null || typeof c !== 'object') return undefined; c = c[k] } return c }
 const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'stage'
 const copyColumns = (columns) => columns.map((column) => ({ ...column }))
+const normalizeColWidth = (width) => {
+  const n = Math.round(Number(width))
+  if (!Number.isFinite(n)) return DEFAULT_COL_WIDTH
+  return Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, n))
+}
 
 M.mount('#app', () => ({
   // ---- state ----
@@ -22,8 +37,20 @@ M.mount('#app', () => ({
   q: { queued: 0, idle: 0, running: 0, done: 0, error: 0, concurrency: 0 },
   logs: [], conc: 0, dragging: null,
   persistTimers: {},
-  logPinned: true, _lastLogTop: 0,
-  chat: { enabled: false, messages: [], input: '', busy: false },
+  logPinned: true, logWrap: false,
+  _logProgrammaticScroll: false, _logStickPending: false,
+  sidebarWidth: 0, logHeight: 180, resizing: false,
+  colResize: null, // { ci, width, startX, startW, moved }
+  rowHeights: {}, // session-only id -> px; not persisted
+  rowResize: null, // { id, startY, startH, moved }
+  chat: {
+    enabled: false, messages: [], input: '', busy: false, elapsed: '', startedAt: 0, timer: null, stopRequested: false,
+    agents: [], agent: '', models: [], model: '', reasoningEffort: 'medium', thinking: false,
+    allowlist: '', allowlistBaseline: '', allowlistOpen: false, allowlistOverridden: false,
+    tools: [], toolsEnabled: null, toolsBaseline: null, toolsOpen: false, toolsLoading: false,
+    toolsError: '', toolsEnabledOverridden: false, contextWindow: 32768, tokensUsed: 0,
+    speak: false, speakWarning: false,
+  },
   editing: null, // {r, ci, value, x, y, w}
   renaming: null, // {id, value}
   magicInput: {}, fieldColumnEdit: null, // ci -> draft prompt / {ci, value}
@@ -38,9 +65,16 @@ M.mount('#app', () => ({
   get columns() { return this.act?.columns ?? [] },
 
   async init() {
+    // Full m-js redraw rebuilds DOM and drops scrollTop; always snapshot/restore.
+    if (!M._sheetsScrollWrap) {
+      M._sheetsScrollWrap = true
+      const rawRedraw = M.redraw.bind(M)
+      const self = this
+      M.redraw = () => self.preserveUiScroll(() => rawRedraw())
+    }
+    this.loadChatPrefs()
     await this.loadMeta()
     this.connectWS()
-    const el = document.querySelector('.gridwrap')
     window.addEventListener('keydown', (e) => this.globalKey(e))
     window.addEventListener('hashchange', () => this.route())
     this.route()
@@ -67,6 +101,7 @@ M.mount('#app', () => ({
   async loadMeta(resetWindow = true) {
     this.meta = await (await fetch('/api/meta')).json()
     this.chat.enabled = this.meta.chat
+    if (this.chat.enabled) await this.loadChatConfig()
     if (!this.actSlug) this.actSlug = this.meta.activities[0]?.slug ?? null
     await this.refreshWindow(resetWindow)
     const [fieldData, stageData] = await Promise.all([
@@ -217,6 +252,7 @@ M.mount('#app', () => ({
   },
   cellUp() { this._dragSel = false },
   colHeadClick(ci, e) {
+    if (this.colResize?.moved || this._suppressColClick) return
     if (e.altKey) return this.toggleSort(ci)
     const range = { r0: 0, c0: ci, r1: Math.max(0, this.total - 1), c1: ci }
     if (e.ctrlKey || e.metaKey) this.sel.ranges.push(range)
@@ -224,7 +260,125 @@ M.mount('#app', () => ({
     this.sel.anchor = { r: 0, c: ci }
     this.sel.active = { r: 0, c: ci }
   },
+  colWidth(ci) {
+    if (this.colResize?.ci === ci) return this.colResize.width
+    const width = this.columns[ci]?.width
+    return width == null || width === '' ? DEFAULT_COL_WIDTH : normalizeColWidth(width)
+  },
+  colStyle(ci) {
+    const width = this.colWidth(ci)
+    return `width:${width}px;min-width:${width}px;max-width:${width}px`
+  },
+  startColResize(ci, e) {
+    if (e.button != null && e.button !== 0) return
+    if (!this.columns[ci]) return
+    e.preventDefault()
+    e.stopPropagation()
+    const startW = this.colWidth(ci)
+    const startX = e.clientX
+    const previousCursor = document.body.style.cursor
+    const previousSelect = document.body.style.userSelect
+    this.colResize = { ci, width: startW, startX, startW, moved: false }
+    this.resizing = true
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.querySelector('table.grid')?.classList.add('col-resizing')
+    const move = (event) => {
+      if (!this.colResize || this.colResize.ci !== ci) return
+      const next = normalizeColWidth(startW + event.clientX - startX)
+      if (Math.abs(event.clientX - startX) > 2) this.colResize.moved = true
+      if (next === this.colResize.width) return
+      this.colResize.width = next
+      M.redraw()
+    }
+    const up = async () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousSelect
+      document.querySelector('table.grid')?.classList.remove('col-resizing')
+      const draft = this.colResize
+      this.colResize = null
+      this.resizing = false
+      if (draft?.moved) {
+        this._suppressColClick = true
+        setTimeout(() => { this._suppressColClick = false }, 0)
+      }
+      M.redraw()
+      if (!draft?.moved) return
+      const width = normalizeColWidth(draft.width)
+      const prevWidth = this.columns[ci]?.width
+      if (prevWidth != null && width === normalizeColWidth(prevWidth)) return
+      if (!this.canPersist()) return this.showToast('refresh to sync before resizing columns')
+      const columns = copyColumns(this.columns)
+      columns[ci] = { ...columns[ci], width }
+      try {
+        await this.patchColumns(columns)
+      } catch (error) {
+        this.showToast(error.message ?? 'could not save column width')
+        M.redraw()
+      }
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+  },
+  rowHeightPx(row) {
+    if (!row?.id) return null
+    const h = this.rowHeights[row.id]
+    return h == null ? null : normalizeRowHeight(h)
+  },
+  rowStyle(row) {
+    const h = this.rowHeightPx(row)
+    return h == null ? '' : `--row-h:${h}px;height:${h}px`
+  },
+  rowClass(row) {
+    return this.rowHeightPx(row) == null ? '' : 'row-h-fixed'
+  },
+  startRowResize(i, e) {
+    if (e.button != null && e.button !== 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    const row = this.rows[i]
+    if (!row?.id) return
+    const tr = e.currentTarget?.closest?.('tr') ?? document.querySelector(`tr[data-row-id="${CSS.escape(row.id)}"]`)
+    const startH = this.rowHeightPx(row) ?? Math.round(tr?.getBoundingClientRect().height || ROWH)
+    const startY = e.clientY
+    const previousCursor = document.body.style.cursor
+    const previousSelect = document.body.style.userSelect
+    this.rowResize = { id: row.id, startY, startH, moved: false }
+    this._suppressRowClick = false
+    document.body.style.cursor = 'row-resize'
+    document.body.style.userSelect = 'none'
+    document.querySelector('table.grid')?.classList.add('row-resizing')
+    const move = (event) => {
+      if (!this.rowResize || this.rowResize.id !== row.id) return
+      const next = normalizeRowHeight(startH + (event.clientY - startY))
+      if (Math.abs(event.clientY - startY) > 2) this.rowResize.moved = true
+      this.rowHeights = { ...this.rowHeights, [row.id]: next }
+      M.redraw()
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousSelect
+      document.querySelector('table.grid')?.classList.remove('row-resizing')
+      if (this.rowResize?.moved) this._suppressRowClick = true
+      this.rowResize = null
+      M.redraw()
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+  },
   rowHeadClick(i, e) {
+    if (this._suppressRowClick) {
+      this._suppressRowClick = false
+      return
+    }
     const r = this.absRow(i)
     const range = { r0: r, c0: 0, r1: r, c1: Math.max(0, this.columns.length - 1) }
     if (e.ctrlKey || e.metaKey) this.sel.ranges.push(range)
@@ -479,7 +633,85 @@ M.mount('#app', () => ({
     this._cellVisualRedrawPending = true
     requestAnimationFrame(() => {
       this._cellVisualRedrawPending = false
-      M.redraw()
+      this.redrawUi()
+    })
+  },
+  // m-js full redraw rebuilds the DOM and resets scroll containers; snapshot/restore.
+  // Restore synchronously after redraw (not only in rAF) so rapid cell-state redraws
+  // during a run cannot yank the log back to an old snap while the user is scrolling.
+  preserveUiScroll(run) {
+    if (this._preservingScroll) return run()
+    this._preservingScroll = true
+    const grid = document.querySelector('.gridwrap')
+    const log = document.querySelector('.logbox')
+    const chat = document.querySelector('.chat .messages')
+    const nearBottom = (el, pad = 40) => !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= pad
+    const snap = {
+      gTop: grid?.scrollTop ?? 0,
+      gLeft: grid?.scrollLeft ?? 0,
+      logTop: log?.scrollTop ?? 0,
+      logPinned: this.logPinned,
+      logUserAt: this._logUserScrollAt ?? 0,
+      chatTop: chat?.scrollTop ?? 0,
+      chatPinned: nearBottom(chat),
+    }
+    try { run() } finally { this._preservingScroll = false }
+    this.restoreUiScroll(snap)
+    // one follow-up frame for layout (images/fonts); skip log if user scrolled since snap
+    requestAnimationFrame(() => this.restoreUiScroll(snap, { followUp: true }))
+  },
+  restoreUiScroll(snap, { followUp = false } = {}) {
+    const g = document.querySelector('.gridwrap')
+    if (g) {
+      g.scrollTop = snap.gTop
+      g.scrollLeft = snap.gLeft
+    }
+    const l = document.querySelector('.logbox')
+    if (l) {
+      const userScrolledSince = (this._logUserScrollAt ?? 0) > snap.logUserAt
+      if (snap.logPinned && this.logPinned) {
+        this._logProgrammaticScroll = true
+        l.scrollTop = l.scrollHeight
+        this._logProgrammaticScroll = false
+      } else if (!userScrolledSince) {
+        // only re-apply the pre-redraw offset when the user hasn't moved the log since
+        this._logProgrammaticScroll = true
+        l.scrollTop = snap.logTop
+        this._logProgrammaticScroll = false
+      }
+      // follow-up must never re-pin or override a live user scroll
+      if (!followUp && snap.logPinned) this.logPinned = true
+    }
+    const c = document.querySelector('.chat .messages')
+    if (c) c.scrollTop = snap.chatPinned ? c.scrollHeight : snap.chatTop
+  },
+  redrawUi() { M.redraw() },
+  isLogNearBottom(el, threshold = 40) {
+    if (!el) return true
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold
+  },
+  stickLogToBottom() {
+    if (!this.logPinned) return
+    const el = document.querySelector('.logbox')
+    if (!el) return
+    this._logProgrammaticScroll = true
+    el.scrollTop = el.scrollHeight
+    this._logProgrammaticScroll = false
+    // second frame: reactive x-for may still be laying out new lines
+    requestAnimationFrame(() => {
+      const box = document.querySelector('.logbox')
+      if (!box || !this.logPinned) return
+      this._logProgrammaticScroll = true
+      box.scrollTop = box.scrollHeight
+      this._logProgrammaticScroll = false
+    })
+  },
+  scheduleLogStick() {
+    if (!this.logPinned || this._logStickPending) return
+    this._logStickPending = true
+    requestAnimationFrame(() => {
+      this._logStickPending = false
+      this.stickLogToBottom()
     })
   },
   async magicSubmit(ci) {
@@ -496,23 +728,17 @@ M.mount('#app', () => ({
         this.markDesync()
         return
       }
-      if (authored.ok) {
-        const stage = await authored.json()
-        this.magicInput[ci] = ''
-        await this.loadMeta()
-        this.chat.messages.push({ who: 'you', body: text })
-        this.chat.messages.push({ who: 'angela', body: stage.summary, events: [] })
-        this.showToast(`Angela created ${stage.slug}`)
+      if (!authored.ok) {
+        const error = await authored.json().catch(() => ({}))
+        this.showToast(error.error ?? `could not create stage (${authored.status})`)
         return
       }
-      slug = slugify(text)
-      const columns = copyColumns(this.columns)
-      columns[ci] = { stage: slug }
-      await fetch(`/api/activity/${this.actSlug}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ columns }) })
+      const stage = await authored.json()
+      slug = stage.slug
       await this.loadMeta()
     }
     this.magicInput[ci] = ''
-    this.chatSend(text, { stage: slug, newSession: true })
+    await this.chatSend(text, { stage: slug, newSession: true })
   },
 
   // ---- run bar ----
@@ -578,13 +804,8 @@ M.mount('#app', () => ({
     })).json()
     if (!r.ok) return this.showToast(r.error ?? 'could not delete rows')
     this.sel = { ranges: [], active: null, anchor: null }
-    const scrollTop = document.querySelector('.gridwrap')?.scrollTop ?? 0
     await this.refreshWindow(false)
     M.redraw()
-    requestAnimationFrame(() => {
-      const grid = document.querySelector('.gridwrap')
-      if (grid) grid.scrollTop = scrollTop
-    })
     this.showToast(`deleted ${r.deleted.length} row${r.deleted.length === 1 ? '' : 's'}`)
   },
 
@@ -632,14 +853,7 @@ M.mount('#app', () => ({
     this.redrawGrid()
     return true
   },
-  redrawGrid() {
-    const scrollTop = document.querySelector('.gridwrap')?.scrollTop ?? 0
-    M.redraw()
-    requestAnimationFrame(() => {
-      const grid = document.querySelector('.gridwrap')
-      if (grid) grid.scrollTop = scrollTop
-    })
-  },
+  redrawGrid() { M.redraw() },
   componentLocked(component) { return !!this.componentLocks[component] },
   async toggleComponent(group) {
     if (!this.canPersist()) return
@@ -695,7 +909,8 @@ M.mount('#app', () => ({
     if (field === this.columns[edit.ci]?.field) return
     if (!/^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)+$/.test(field)) return this.showToast('field path must be component.field')
     const columns = copyColumns(this.columns)
-    columns[edit.ci] = { field }
+    const prev = columns[edit.ci] ?? {}
+    columns[edit.ci] = prev.width != null ? { field, width: prev.width } : { field }
     if (!await this.patchColumns(columns)) return
     M.redraw()
     this.showToast(`saved ${field}`)
@@ -850,24 +1065,23 @@ M.mount('#app', () => ({
   pushLog(ev) {
     this.logs.push(ev)
     if (this.logs.length > 500) this.logs.shift()
-    if (this.logPinned) requestAnimationFrame(() => {
-      const el = document.querySelector('.logbox')
-      if (!el || !this.logPinned) return
-      el.scrollTop = el.scrollHeight
-      this._lastLogTop = el.scrollTop
-    })
+    this.scheduleLogStick()
   },
   logScroll(e) {
-    const el = e.currentTarget
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-    if (el.scrollTop < this._lastLogTop) {
-      this.logPinned = false
-    } else if (distance <= 32) {
-      this.logPinned = true
-    }
-    this._lastLogTop = el.scrollTop
+    // Ignore programmatic stick-to-bottom / post-redraw restores so they don't unpin.
+    if (this._logProgrammaticScroll) return
+    this._logUserScrollAt = performance.now()
+    this.logPinned = this.isLogNearBottom(e.currentTarget)
   },
-  logWheel(e) { if (e.deltaY < 0) this.logPinned = false },
+  logWheel(e) {
+    // Wheel fires before scroll position updates; mark user intent and re-check pin after.
+    this._logUserScrollAt = performance.now()
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.logbox')
+      if (!el) return
+      this.logPinned = this.isLogNearBottom(el)
+    })
+  },
   logHtml(ev) {
     const ts = new Date(ev.ts).toTimeString().slice(0, 8)
     return `<span class="ts">${ts}</span> <span style="color:${hashColor(ev.stage)}">${esc(ev.stage)}</span> <span style="color:${hashColor(ev.entity)}">${esc(ev.entity)}</span> ${esc(ev.line)}`
@@ -912,6 +1126,352 @@ M.mount('#app', () => ({
   },
 
   // ---- chat (Ε/Θ) ----
+  loadChatPrefs() {
+    try {
+      const prefs = JSON.parse(localStorage.getItem('sheets-chat') || '{}')
+      this.chat.model = String(prefs.model ?? '')
+      this.chat.reasoningEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(prefs.reasoningEffort) ? prefs.reasoningEffort : 'medium'
+      this.chat.thinking = prefs.thinking === true
+      this.chat.speak = prefs.speak === true
+      this.sidebarWidth = Number(prefs.sidebarWidth) || 0
+      this.logHeight = Number(prefs.logHeight) || 180
+      this.logWrap = prefs.logWrap === true
+    } catch {}
+  },
+  persistChatPrefs() {
+    try {
+      localStorage.setItem('sheets-chat', JSON.stringify({
+        model: this.chat.model, reasoningEffort: this.chat.reasoningEffort,
+        thinking: this.chat.thinking, speak: this.chat.speak,
+        sidebarWidth: this.sidebarWidth, logHeight: this.logHeight,
+        logWrap: this.logWrap === true,
+      }))
+    } catch {}
+  },
+  toggleLogWrap() {
+    this.logWrap = !this.logWrap
+    this.persistChatPrefs()
+  },
+  sidebarStyle() {
+    return this.sidebarWidth > 0 ? { width: `${this.sidebarWidth}px`, flex: '0 0 auto' } : {}
+  },
+  logStyle() {
+    return { height: `${this.logHeight}px`, flex: '0 0 auto' }
+  },
+  startSidebarWidthResize(e) {
+    if (e.button != null && e.button !== 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    const sidebar = document.querySelector('.sidebar')
+    const startW = sidebar?.getBoundingClientRect().width ?? 320
+    const startX = e.clientX
+    const previousCursor = document.body.style.cursor
+    const previousSelect = document.body.style.userSelect
+    this.resizing = true
+    document.body.style.cursor = 'ew-resize'
+    document.body.style.userSelect = 'none'
+    const move = (event) => {
+      const max = Math.max(360, window.innerWidth - 360)
+      this.sidebarWidth = Math.max(300, Math.min(max, startW + startX - event.clientX))
+      M.redraw()
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      this.resizing = false
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousSelect
+      this.persistChatPrefs()
+      M.redraw()
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  },
+  startChatResize(e) {
+    if (e.button != null && e.button !== 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    const sidebar = document.querySelector('.sidebar')
+    const logbox = document.querySelector('.logbox')
+    const queuebox = document.querySelector('.queuebox')
+    const startH = logbox?.getBoundingClientRect().height ?? this.logHeight
+    const startY = e.clientY
+    const sidebarH = sidebar?.getBoundingClientRect().height ?? window.innerHeight
+    const queueH = queuebox?.getBoundingClientRect().height ?? 48
+    const max = Math.max(80, sidebarH - queueH - 6 - 180)
+    const previousCursor = document.body.style.cursor
+    const previousSelect = document.body.style.userSelect
+    this.resizing = true
+    document.body.style.cursor = 'ns-resize'
+    document.body.style.userSelect = 'none'
+    const move = (event) => {
+      this.logHeight = Math.max(80, Math.min(max, startH + event.clientY - startY))
+      M.redraw()
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      this.resizing = false
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousSelect
+      this.persistChatPrefs()
+      M.redraw()
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  },
+  async loadChatConfig() {
+    try {
+      const response = await fetch('/api/chat/config')
+      if (!response.ok) throw new Error('chat config unavailable')
+      const config = await response.json()
+      this.chat.agents = config.agents ?? []
+      this.chat.agent = config.agent ?? this.chat.agents[0]?.name ?? 'angela'
+      this.chat.models = config.models ?? []
+      if (!this.chat.model || !this.chat.models.includes(this.chat.model)) this.chat.model = config.model ?? this.chat.models[0] ?? ''
+      if (this.chat.model && !this.chat.models.includes(this.chat.model)) this.chat.models.unshift(this.chat.model)
+      this.chat.contextWindow = Number(config.contextWindow ?? 32768)
+      this.chat.allowlist = String(config.allowlist ?? '')
+      this.chat.allowlistBaseline = String(config.allowlistBaseline ?? config.allowlist ?? '')
+      this.chat.allowlistOverridden = Boolean(config.allowlistOverridden)
+      this.chat.toolsEnabled = config.toolsEnabled ?? null
+      this.chat.toolsBaseline = config.toolsBaseline ?? null
+      this.chat.toolsEnabledOverridden = Boolean(config.toolsEnabledOverridden)
+      this.chat.thinking = config.thinking === true || this.chat.thinking
+      this.chat.reasoningEffort = config.reasoningEffort ?? this.chat.reasoningEffort
+      this.persistChatPrefs()
+    } catch (error) {
+      this.showToast(error.message ?? 'chat config unavailable')
+    }
+  },
+  async resetChatSession() {
+    try { await fetch('/api/chat/new', { method: 'POST' }) } catch {}
+    this.chat.sessionId = null
+  },
+  chatAgentChange(e) {
+    this.chat.agent = e.target.value
+    this.resetChatSession()
+  },
+  chatModelChange(e) {
+    this.chat.model = e.target.value
+    this.persistChatPrefs()
+    this.resetChatSession()
+  },
+  chatEffortChange(e) {
+    this.chat.reasoningEffort = e.target.value
+    this.persistChatPrefs()
+  },
+  toggleChatThinking() {
+    this.chat.thinking = !this.chat.thinking
+    this.persistChatPrefs()
+  },
+  toggleChatSpeak() {
+    this.chat.speak = !this.chat.speak
+    this.chat.speakWarning = false
+    this.persistChatPrefs()
+  },
+  chatAllowlistInput(e) {
+    if (e?.target) this.chat.allowlist = e.target.value
+    this.chat.allowlistOverridden = this.chat.allowlist !== this.chat.allowlistBaseline
+  },
+  toggleChatAllowlist() {
+    this.chat.allowlistOpen = !this.chat.allowlistOpen
+    if (this.chat.allowlistOpen) this.chat.toolsOpen = false
+  },
+  async chatAllowlistBlur() {
+    this.chatAllowlistInput()
+    const response = await fetch('/api/chat/allowlist', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ allowlist: this.chat.allowlist, overridden: this.chat.allowlistOverridden }),
+    })
+    if (!response.ok) this.showToast('could not update allowlist')
+  },
+  async resetChatAllowlist() {
+    this.chat.allowlist = this.chat.allowlistBaseline
+    this.chat.allowlistOverridden = false
+    await this.chatAllowlistBlur()
+  },
+  async loadChatTools() {
+    if (this.chat.toolsLoading) return
+    this.chat.toolsLoading = true
+    this.chat.toolsError = ''
+    try {
+      const response = await fetch('/api/chat/tools')
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error ?? 'tools unavailable')
+      this.chat.tools = data.tools ?? []
+      if (!this.chat.toolsEnabledOverridden) {
+        this.chat.toolsEnabled = data.toolsEnabled ?? null
+        this.chat.toolsBaseline = data.toolsEnabled ?? null
+      }
+    } catch (error) {
+      this.chat.toolsError = error.message ?? 'tools unavailable'
+    } finally {
+      this.chat.toolsLoading = false
+    }
+  },
+  toggleChatTools() {
+    this.chat.toolsOpen = !this.chat.toolsOpen
+    if (this.chat.toolsOpen) {
+      this.chat.allowlistOpen = false
+      this.loadChatTools()
+    }
+  },
+  chatToolChecked(tool) {
+    return this.chat.toolsEnabled == null || this.chat.toolsEnabled.includes(tool.name)
+  },
+  async setChatToolEnabled(name, enabled) {
+    const names = this.chat.tools.map((tool) => tool.name)
+    const selected = new Set(this.chat.toolsEnabled == null ? names : this.chat.toolsEnabled)
+    if (enabled) selected.add(name)
+    else selected.delete(name)
+    this.chat.toolsEnabled = names.filter((toolName) => selected.has(toolName))
+    this.chat.toolsEnabledOverridden = true
+    await this.persistChatTools()
+  },
+  async persistChatTools() {
+    const response = await fetch('/api/chat/tools-enabled', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ toolsEnabled: this.chat.toolsEnabled, overridden: this.chat.toolsEnabledOverridden }),
+    })
+    if (!response.ok) this.showToast('could not update tools')
+  },
+  async enableAllChatTools() {
+    this.chat.toolsEnabled = this.chat.tools.map((tool) => tool.name)
+    this.chat.toolsEnabledOverridden = true
+    await this.persistChatTools()
+  },
+  async disableAllChatTools() {
+    this.chat.toolsEnabled = []
+    this.chat.toolsEnabledOverridden = true
+    await this.persistChatTools()
+  },
+  async resetChatTools() {
+    this.chat.toolsEnabled = this.chat.toolsBaseline
+    this.chat.toolsEnabledOverridden = false
+    await this.persistChatTools()
+  },
+  chatContextPct() {
+    const max = Number(this.chat.contextWindow) || 0
+    return max ? Math.min(100, Math.max(0, Number(this.chat.tokensUsed || 0) / max * 100)) : 0
+  },
+  chatContextLabel() {
+    const used = Number(this.chat.tokensUsed || 0)
+    if (used >= 1000) return `${(used / 1000).toFixed(used >= 10000 ? 0 : 1)}k`
+    return String(used)
+  },
+  chatContextTitle() {
+    const used = Number(this.chat.tokensUsed || 0)
+    const max = Number(this.chat.contextWindow || 0)
+    return `context: ${used.toLocaleString()} / ${max.toLocaleString()} tokens`
+  },
+  chatApproval(event) {
+    const existing = this.chat.messages.find((message) => message.who === 'approval' && message.approvalId === event.id)
+    if (existing) {
+      existing.status = 'pending'
+      return
+    }
+    this.chat.messages.push({
+      who: 'approval', body: '', approvalId: event.id, name: event.name ?? event.tool ?? 'tool',
+      command: event.command ?? '', args: event.args ?? {}, reason: event.reason ?? 'not on allowlist',
+      status: 'pending', visible: true, bookmarked: false,
+    })
+  },
+  async chatApprove(message, decision) {
+    const response = await fetch('/api/chat/approve', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: message.approvalId, decision }),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (response.ok && result.ok) message.status = decision === 'allow' ? 'allowed' : 'denied'
+    else message.status = 'error'
+    M.redraw()
+  },
+  stripChatMarkup(text) {
+    return String(text ?? '').replace(/```[\s\S]*?```/g, ' ').replace(/!?(\[[^\]]+\])\([^)]*\)/g, '$1').replace(/[\[\]*_~`>#]/g, '').replace(/\s+/g, ' ').trim()
+  },
+  async speakChatMessage(message) {
+    if (!this.chat.speak || !message?.body || message.body.startsWith('⚠') || message.body.startsWith('(stopped)')) return
+    const text = this.stripChatMarkup(message.body)
+    if (!text) return
+    try {
+      const response = await fetch(`/speak?text=${encodeURIComponent(text.slice(0, 4000))}`)
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || result.error) this.chat.speakWarning = true
+    } catch { this.chat.speakWarning = true }
+    M.redraw()
+  },
+  formatChatElapsed(ms) { return `${(Math.max(0, ms) / 1000).toFixed(3)}s` },
+  startChatClock() {
+    this.stopChatClock(false)
+    this.chat.startedAt = performance.now()
+    const tick = () => {
+      this.chat.elapsed = this.formatChatElapsed(performance.now() - this.chat.startedAt)
+      M.redraw()
+    }
+    tick()
+    this.chat.timer = setInterval(tick, 100)
+  },
+  stopChatClock(freeze = true) {
+    if (this.chat.timer) clearInterval(this.chat.timer)
+    this.chat.timer = null
+    if (freeze && this.chat.startedAt) this.chat.elapsed = this.formatChatElapsed(performance.now() - this.chat.startedAt)
+    if (!freeze) this.chat.elapsed = ''
+  },
+  updateChatTelemetry(message, patch = {}) {
+    if (!message) return
+    const telemetry = message.telemetry ??= { startedAt: this.chat.startedAt }
+    const now = performance.now()
+    if (!telemetry.startedAt) telemetry.startedAt = this.chat.startedAt || now
+    telemetry.elapsedMs = Math.max(0, now - telemetry.startedAt)
+    if (message.body && !telemetry.firstTokenAt) {
+      telemetry.firstTokenAt = now
+      telemetry.ttftMs = telemetry.firstTokenAt - telemetry.startedAt
+    }
+    const estimatedTokens = Math.max(0, Math.ceil(String(message.body ?? '').replace(/\s+/g, ' ').trim().length / 4))
+    if (estimatedTokens) telemetry.estimatedTokens = estimatedTokens
+    const completionTokens = patch.completionTokens ?? patch.completion_tokens
+    if (completionTokens != null && Number.isFinite(Number(completionTokens))) telemetry.completionTokens = Number(completionTokens)
+    const tokPerSec = patch.tokPerSec ?? patch.tok_per_sec
+    if (tokPerSec != null && Number.isFinite(Number(tokPerSec))) telemetry.tokPerSec = Number(tokPerSec)
+    const ttftMs = patch.ttftMs ?? patch.ttft_ms
+    if (ttftMs != null && Number.isFinite(Number(ttftMs))) telemetry.ttftMs = Number(ttftMs)
+    const finishReason = patch.finishReason ?? patch.finish_reason ?? patch.stop_reason
+    if (finishReason) telemetry.finishReason = String(finishReason)
+    if (patch.error) telemetry.error = String(patch.error)
+    if (telemetry.tokPerSec == null && telemetry.estimatedTokens && telemetry.elapsedMs > 0) {
+      telemetry.tokPerSec = telemetry.estimatedTokens / (telemetry.elapsedMs / 1000)
+    }
+  },
+  chatTelemetryHtml(message) {
+    const t = message?.telemetry
+    if (!t) return ''
+    const chip = (icon, text) => `<span class="metric-chip"><i class="ph ${icon}" aria-hidden="true"></i><span>${esc(text)}</span></span>`
+    const chips = []
+    if (t.tokPerSec != null && Number.isFinite(Number(t.tokPerSec))) chips.push(chip('ph-gauge', `${Number(t.tokPerSec).toFixed(2)} tps`))
+    const tokenCount = t.completionTokens ?? t.estimatedTokens
+    if (tokenCount > 0) chips.push(chip('ph-text-aa', `${t.completionTokens == null ? '~' : ''}${tokenCount} tok`))
+    if (t.ttftMs != null && Number.isFinite(Number(t.ttftMs))) chips.push(chip('ph-timer', `${(Number(t.ttftMs) / 1000).toFixed(2)}s ttft`))
+    const finish = t.finishReason || (t.error ? 'error' : '')
+    if (finish) chips.push(chip('ph-flag-banner', `finish: ${finish}`))
+    if (t.error) chips.push(chip('ph-warning', t.error.slice(0, 40)))
+    return chips.join('')
+  },
+  toggleChatMessageVisible(message) {
+    if (!message) return
+    message.visible = message.visible === false
+    M.redraw()
+  },
+  toggleChatMessageBookmark(message) {
+    if (!message) return
+    message.bookmarked = !message.bookmarked
+    M.redraw()
+  },
+  async chatStop() {
+    if (!this.chat.busy) return
+    this.chat.stopRequested = true
+    try { await fetch('/api/chat/abort', { method: 'POST' }) } catch {}
+  },
   focusedStage() {
     if (this.focus) return this.focus.slug
     const c = this.sel.active?.c
@@ -921,14 +1481,23 @@ M.mount('#app', () => ({
     text = text ?? this.chat.input.trim()
     if (!text || this.chat.busy) return
     this.chat.input = ''
-    this.chat.messages.push({ who: 'you', body: text })
-    const asst = { who: 'angela', body: '', events: [] }
+    this.chat.messages.push({ who: 'you', body: text, visible: true, bookmarked: false })
+    this.startChatClock()
+    const asst = { who: 'angela', body: '', events: [], visible: true, bookmarked: false, telemetry: { startedAt: this.chat.startedAt } }
     this.chat.messages.push(asst)
     this.chat.busy = true
     try {
       const sample = this.rows[0]?.doc ?? null
       const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ content: text, activity: this.actSlug, selection: this.selA1() || null, stage: opts.stage ?? this.focusedStage(), entitySample: sample, newSession: opts.newSession ?? false }) })
+        body: JSON.stringify({
+          content: text, activity: this.actSlug, selection: this.selA1() || null,
+          stage: opts.stage ?? this.focusedStage(), entitySample: sample,
+          newSession: opts.newSession ?? false, agent: this.chat.agent, model: this.chat.model,
+          thinking: this.chat.thinking, reasoning_effort: this.chat.reasoningEffort,
+          allowlist: this.chat.allowlist, allowlistOverridden: this.chat.allowlistOverridden,
+          toolsEnabled: this.chat.toolsEnabled, toolsEnabledOverridden: this.chat.toolsEnabledOverridden,
+        }) })
+      if (!res.ok || !res.body) throw new Error(await res.text() || `chat failed (${res.status})`)
       const reader = res.body.getReader()
       const dec = new TextDecoder()
       let buf = ''
@@ -940,18 +1509,46 @@ M.mount('#app', () => ({
         for (const line of lines) {
           if (!line.trim()) continue
           let ev; try { ev = JSON.parse(line) } catch { continue }
-          if (ev.type === 'assistant_delta') asst.body += ev.text
-          else if (ev.type === 'error') asst.body += `\n⚠ ${ev.error}`
-          else if (ev.type === 'event' && ev.event?.type === 'tool_call') asst.events.push(`⚙ ${ev.event.name ?? 'tool'}`)
-          else if (ev.type === 'done' && !asst.body) asst.body = ev.text ?? ''
+          if (ev.type === 'session') {
+            this.chat.sessionId = ev.id ?? null
+            this.chat.agent = ev.agent ?? this.chat.agent
+            this.chat.model = ev.model ?? this.chat.model
+            this.chat.contextWindow = Number(ev.contextWindow ?? this.chat.contextWindow)
+          } else if (ev.type === 'assistant_delta') {
+            asst.body += ev.text
+            this.updateChatTelemetry(asst)
+          } else if (ev.type === 'error') {
+            asst.body += `\n⚠ ${ev.error}`
+            this.updateChatTelemetry(asst, { error: ev.error, finishReason: 'error' })
+          } else if (ev.type === 'approval_needed') {
+            this.chatApproval(ev)
+          } else if (ev.type === 'event' && ev.event?.type === 'approval_needed') {
+            this.chatApproval(ev.event)
+          } else if (ev.type === 'event' && ev.event?.type === 'tool_call') {
+            asst.events.push(`⚙ ${ev.event.name ?? 'tool'}`)
+          } else if (ev.type === 'event' && ev.event?.type === 'tool_result') {
+            asst.events.push(`${ev.event.ok === false ? '⚠' : '✓'} ${ev.event.name ?? 'tool'}`)
+          } else if (ev.type === 'event' && ['gen_info', 'usage'].includes(ev.event?.type)) {
+            this.updateChatTelemetry(asst, ev.event)
+          } else if (ev.type === 'done') {
+            if (!asst.body) asst.body = ev.text ?? ''
+            this.chat.tokensUsed = Number(ev.prompt_tokens ?? this.chat.tokensUsed)
+            this.updateChatTelemetry(asst, ev.gen_info ?? { finishReason: this.chat.stopRequested ? 'stop' : 'stop' })
+          }
           M.redraw()
           const el = document.querySelector('.chat .messages'); if (el) el.scrollTop = el.scrollHeight
         }
       }
     } catch (e) {
       asst.body += `\n⚠ ${e.message}`
+      this.updateChatTelemetry(asst, { error: e.message, finishReason: 'error' })
     } finally {
+      this.updateChatTelemetry(asst, { finishReason: asst.telemetry?.finishReason ?? (this.chat.stopRequested ? 'stop' : 'stop') })
+      this.stopChatClock()
       this.chat.busy = false
+      this.chat.stopRequested = false
+      this.speakChatMessage(asst)
+      M.redraw()
     }
   },
   chatKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.chatSend() } },
@@ -1053,19 +1650,20 @@ M.mount('#app', () => ({
       </div>
 
       <div class="gridwrap" x-show="!focus" @scroll="onScroll()" @mouseup="cellUp()">
-        <table class="grid">
+        <table class="grid" :class="(colResize ? 'col-resizing ' : '') + (rowResize ? 'row-resizing' : '')">
           <thead>
             <tr>
               <th class="corner rowhead"><span style="color:var(--dim)" x-text="total + ' rows'"></span></th>
-              <th class="colhead" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :class="colSelected(ci) ? 'selected-head' : ''" @click="colHeadClick(ci, $event)"
-                :title="'click: select column · alt-click: sort'">
+              <th class="colhead col-resizable" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :class="colSelected(ci) ? 'selected-head' : ''" :style="colStyle(ci)" @click="colHeadClick(ci, $event)"
+                :title="'click: select column · alt-click: sort · drag edge: resize'">
                 <span class="letter" x-text="colLetter(ci)"></span>
                 <span x-text="sort && sort.ci === ci ? (sort.dir === 'asc' ? '↑' : '↓') : ''"></span>
+                <div class="col-resize" :class="colResize && colResize.ci === ci ? 'active' : ''" title="drag to resize column" @pointerdown="startColResize(ci, $event)"></div>
               </th>
             </tr>
             <tr class="magic">
               <th class="rowhead"></th>
-              <th x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci">
+              <th class="col-resizable" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :style="colStyle(ci)">
                 <div class="magic-cell" :class="colRunning(ci) > 0 ? 'processing' : ''">
                   <input class="field-path-edit" x-show="col.field && fieldColumnEdit && fieldColumnEdit.ci === ci"
                     :value="fieldColumnEdit && fieldColumnEdit.ci === ci ? fieldColumnEdit.value : ''"
@@ -1085,24 +1683,28 @@ M.mount('#app', () => ({
                     <button x-show="!col.stage && magicInput[ci]" @click="magicSubmit(ci)" title="send to Angela">✨</button>
                   </span>
                 </div>
+                <div class="col-resize" :class="colResize && colResize.ci === ci ? 'active' : ''" title="drag to resize column" @pointerdown="startColResize(ci, $event)"></div>
               </th>
             </tr>
           </thead>
           <tbody>
             <tr x-show="topPad > 0"><td :colspan="columns.length + 1" :style="'height:' + topPad + 'px;padding:0;border:0'"></td></tr>
-            <tr x-for="row, i in rows" :key="row.id">
+            <tr x-for="row, i in rows" :key="row.id" :data-row-id="row.id" :class="rowClass(row)" :style="rowStyle(row)">
               <td class="rowhead" :class="rowSelected(i) ? 'selected-head' : ''" @click="rowHeadClick(i, $event)">
                 <span class="rownum" x-text="winStart + i + 1"></span>
                 <input class="row-rename-input" x-show="renaming && renaming.id === row.id" x-model="renaming.value"
                   @keydown="renameKey($event)" @blur="commitRename()" :title="row.id">
                 <span class="rowlabel" x-show="!renaming || renaming.id !== row.id" x-text="row.label" :title="row.id"
                   @click.stop="startRename(i)"></span>
+                <div class="row-resize" :class="rowResize && rowResize.id === row.id ? 'active' : ''"
+                  title="drag to resize row" @pointerdown="startRowResize(i, $event)"></div>
               </td>
-              <td x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :data-r="i" :data-c="ci"
+              <td x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :data-r="i" :data-c="ci" :style="colStyle(ci)"
                 :class="(inSel(i, ci) ? 'sel ' : '') + (isActive(i, ci) ? 'active ' : '') + cellStateClass(row, ci)"
                 @mousedown="cellDown(i, ci, $event)" @mouseover="cellOver(i, ci, $event)"
-                @dblclick="cellDbl(i, ci)"
-                x-html="cellHtml(row, ci)"></td>
+                @dblclick="cellDbl(i, ci)">
+                <div class="cell-inner" x-html="cellHtml(row, ci)"></div>
+              </td>
             </tr>
             <tr x-show="bottomPad > 0"><td :colspan="columns.length + 1" :style="'height:' + bottomPad + 'px;padding:0;border:0'"></td></tr>
           </tbody>
@@ -1125,7 +1727,7 @@ M.mount('#app', () => ({
       </div>
     </div>
 
-    <div class="sidebar">
+    <div class="sidebar" :class="resizing ? 'resizing' : ''" :style="sidebarStyle()">
       <div class="queuebox">
         <div class="qbar">
           <div :style="qSeg('done') + ';background:var(--done)'"></div>
@@ -1146,24 +1748,89 @@ M.mount('#app', () => ({
           </div>
         </div>
       </div>
-      <div class="logbox" @scroll="logScroll($event)" @wheel="logWheel($event)">
-        <div x-for="ev, i in logs" :key="i" x-html="logHtml(ev)"></div>
+      <div class="loghead">
+        <span class="loghead-label">log</span>
+        <button class="log-wrap-btn" :class="logWrap ? 'on' : ''" @click="toggleLogWrap()"
+          :title="logWrap ? 'disable word wrap' : 'enable word wrap'">
+          <i class="ph ph-paragraph" aria-hidden="true"></i>
+        </button>
       </div>
+      <div class="logbox" :class="logWrap ? 'wrap' : ''" :style="logStyle()" @scroll="logScroll($event)" @wheel="logWheel($event)">
+        <div class="logline" x-for="ev, i in logs" :key="i" x-html="logHtml(ev)"></div>
+      </div>
+      <div class="sidebar-resize-h" title="resize log and chat" @pointerdown="startChatResize($event)"></div>
       <div class="chat">
+        <div class="chat-header">
+          <span class="chat-title">angela</span>
+          <span class="chat-elapsed" x-show="chat.elapsed" x-text="chat.elapsed"></span>
+          <button class="chat-speaker" :class="chat.speak ? 'on' : ''" @click="toggleChatSpeak()" :title="chat.speak ? 'disable Ada voice output' : 'enable Ada voice output'"><i class="ph ph-speaker-high" aria-hidden="true"></i></button>
+          <button class="chat-stop" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph ph-stop" aria-hidden="true"></i></button>
+        </div>
+        <div class="chat-speak-warning" x-show="chat.speakWarning">Ada voice output is unavailable. Check that the <b>ada</b> command is installed.</div>
         <div class="disabled" x-show="!chat.enabled">Angela chat is off — run <b>sheets init</b> in this workspace to scaffold .angela/agents/angela.coffee, then restart the server.</div>
         <div class="messages" x-show="chat.enabled">
-          <div class="msg" x-for="m, i in chat.messages" :key="i" :class="m.who === 'you' ? 'user' : ''">
+          <div class="msg" x-for="m, i in chat.messages" :key="i" :class="(m.who === 'you' ? 'user' : (m.who === 'approval' ? 'approval' : 'assistant')) + (m.visible === false ? ' hidden' : '') + (m.bookmarked ? ' bookmarked' : '')">
             <div class="who" x-text="m.who"></div>
             <div class="ev" x-for="e, j in m.events || []" :key="j" x-text="e"></div>
-            <div class="body" x-text="m.body"></div>
+            <div class="body" x-show="m.who !== 'approval'" x-text="m.body"></div>
+            <div class="approval-card" x-show="m.who === 'approval'">
+              <div class="approval-title"><i class="ph ph-warning" aria-hidden="true"></i><span>approval required</span></div>
+              <div class="approval-name" x-text="m.name"></div>
+              <div class="approval-reason" x-text="m.reason"></div>
+              <pre class="approval-command" x-show="m.command" x-text="m.command"></pre>
+              <div class="approval-actions" x-show="m.status === 'pending'">
+                <button class="approval-allow" @click="chatApprove(m, 'allow')">Allow</button>
+                <button class="approval-deny" @click="chatApprove(m, 'deny')">Deny</button>
+              </div>
+              <div class="approval-status" x-show="m.status !== 'pending'" x-text="m.status"></div>
+            </div>
+            <div class="msg-gutter">
+              <div class="gutter-actions">
+                <button class="gutter-btn" @click="toggleChatMessageVisible(m)" :title="m.visible === false ? 'include message in context' : 'exclude message from context'"><i class="ph" :class="m.visible === false ? 'ph-eye-slash' : 'ph-eye'" aria-hidden="true"></i></button>
+                <button class="gutter-btn" :class="m.bookmarked ? 'on' : ''" @click="toggleChatMessageBookmark(m)" :title="m.bookmarked ? 'remove bookmark' : 'bookmark message'"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></button>
+              </div>
+              <div class="chat-metrics" x-html="chatTelemetryHtml(m)"></div>
+            </div>
           </div>
         </div>
         <div class="composer" x-show="chat.enabled">
-          <textarea rows="2" placeholder="ask Angela… (selection context attaches automatically)"
+          <div class="allowlist-panel" x-show="chat.allowlistOpen">
+            <div class="panel-label"><span>allowed tools</span><span x-text="chat.allowlistOverridden ? '· ui override' : '· agent default'"></span></div>
+            <textarea class="allowlist-editor" rows="5" :value="chat.allowlist" @input="chatAllowlistInput($event)" @blur="chatAllowlistBlur()" spellcheck="false"></textarea>
+            <button class="panel-reset" @click="resetChatAllowlist()">reset to agent default</button>
+          </div>
+          <div class="tools-panel" x-show="chat.toolsOpen">
+            <div class="panel-label"><span>tools for inference</span><span x-text="chat.toolsEnabledOverridden ? '· ui override' : '· agent default'"></span></div>
+            <div class="tools-actions"><button @click="enableAllChatTools()">all</button><button @click="disableAllChatTools()">none</button><button @click="resetChatTools()">reset</button></div>
+            <div class="tools-loading" x-show="chat.toolsLoading">loading tools…</div>
+            <div class="tools-error" x-show="chat.toolsError" x-text="chat.toolsError"></div>
+            <label class="tool-row" x-for="tool in chat.tools" :key="tool.name">
+              <input type="checkbox" :checked="chatToolChecked(tool)" @change="setChatToolEnabled(tool.name, $event.target.checked)">
+              <span x-text="tool.name" :title="tool.description"></span>
+            </label>
+          </div>
+          <textarea class="chat-draft" rows="2" placeholder="Message… (Enter send, Shift+Enter newline; selection context attaches automatically)"
             x-model="chat.input" @keydown="chatKey($event)"></textarea>
-          <button class="primary" @click="chatSend()" :disabled="chat.busy" x-text="chat.busy ? '…' : '➤'"></button>
+          <div class="composer-row">
+            <select class="chat-dd agent-dd" :value="chat.agent" @change="chatAgentChange($event)" title="agent">
+              <option x-for="agent in chat.agents" :key="agent.name" :value="agent.name" x-text="agent.name"></option>
+            </select>
+            <select class="chat-dd model-dd" :value="chat.model" @change="chatModelChange($event)" title="model">
+              <option x-for="model in chat.models" :key="model" :value="model" x-text="model"></option>
+            </select>
+            <select class="chat-dd effort-dd" :value="chat.reasoningEffort" @change="chatEffortChange($event)" title="reasoning effort">
+              <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
+            </select>
+            <button class="chat-icon-btn" :class="chat.thinking ? 'on' : ''" @click="toggleChatThinking()" title="toggle model thinking"><i class="ph ph-brain" aria-hidden="true"></i></button>
+            <div class="context-meter" :style="'--context-pct:' + chatContextPct() + '%'" :title="chatContextTitle()"><span x-text="chatContextLabel()"></span></div>
+            <button class="chat-icon-btn" :class="chat.toolsOpen ? 'on' : ''" @click="toggleChatTools()" title="tools for inference"><i class="ph ph-wrench" aria-hidden="true"></i></button>
+            <button class="chat-icon-btn" :class="chat.allowlistOpen ? 'on' : ''" @click="toggleChatAllowlist()" title="allowlist"><i class="ph ph-shield-check" aria-hidden="true"></i></button>
+            <button class="chat-send chat-stop-inline" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph ph-stop" aria-hidden="true"></i></button>
+            <button class="chat-send primary" x-show="!chat.busy" @click="chatSend()" :disabled="!chat.input.trim()" title="send message"><i class="ph ph-paper-plane-right" aria-hidden="true"></i></button>
+          </div>
         </div>
       </div>
+      <div class="sidebar-resize-w" title="resize sidebar" @pointerdown="startSidebarWidthResize($event)"></div>
     </div>
   </div>
   <div class="toast" x-show="toast" x-text="toast"></div>
