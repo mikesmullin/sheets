@@ -1,5 +1,6 @@
 # The sheets server (§2, §10): owns the files, runs stages, hosts Angela.
-# HTTP API + /ws/run NDJSON event fan-out + static SPA. Browser and CLI are peer clients.
+# HTTP API + /ws/run NDJSON event fan-out + static SPA + /__m_hmr (m-js-style public HMR).
+# Browser and CLI are peer clients.
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -73,11 +74,26 @@ export startServer = (opts = {}) ->
   engine.setConcurrency ws.concurrency
   chat = createChatApi ws, { stages, activities, store, engine }
   sockets = new Set()
+  hmrClients = new Set()
   watchers = []
 
   broadcast = (ev) ->
     msg = JSON.stringify ev
     sock.send msg for sock from sockets
+    null
+
+  # m-js v3 HMR protocol: { type: 'change', path: '/rel' } over ws://host/__m_hmr
+  broadcastHmr = (relPath) ->
+    rel = String(relPath ? '').replace(/\\/g, '/').replace /^\/+/, ''
+    return null unless rel
+    payload = JSON.stringify { type: 'change', path: "/#{rel}" }
+    n = 0
+    for sock from hmrClients
+      try
+        sock.send payload
+        n++
+      catch then null
+    console.log "[hmr] #{rel} → #{n} client(s)"
     null
   persisted = (resource, data = {}) ->
     ev = { type: 'persisted', resource }
@@ -130,6 +146,14 @@ export startServer = (opts = {}) ->
         persisted 'entity', { source: dir, id }
         engine.pump()   # external mutation may satisfy idle gates (§5)
 
+  # SPA asset HMR (m-js hot-client): watch public/ and push path changes
+  watchSafe PUBLIC, (event, fname) ->
+    return unless fname?
+    ext = path.extname(fname).toLowerCase()
+    return unless ext in ['.js', '.mjs', '.css', '.html']
+    rel = String(fname).replace /\\/g, '/'
+    debounce "hmr:#{rel}", 50, -> broadcastHmr rel
+
   # load every activity source into the PGLite mirror
   loadAll = ->
     dirs = new Set(a.source for a in activities.list())
@@ -151,18 +175,115 @@ export startServer = (opts = {}) ->
       displayCache.set source, E.displayFieldsFor source
     displayCache.get source
 
-  # order ids for a source per sort spec; comparator sort loads docs in-memory (§4 sort)
+  # Flatten a cell value for user sort/filter (string compare / regex).
+  cellText = (doc, dotPath) ->
+    return '' unless dotPath
+    v = E.getPath doc, dotPath
+    return '' if v is undefined or v is null
+    return JSON.stringify v if typeof v is 'object'
+    String v
+
+  # User column sort/filter always keys off a field path. Stage modules may expose
+  # sort() as a default only when the user has not chosen A–Z / Z–A themselves.
+  resolveWritesPath = (stageSlug) ->
+    return null unless stageSlug
+    meta = try await stages.meta stageSlug catch then null
+    return null if meta?.error?
+    w = meta?.writes
+    return null unless Array.isArray(w) and w.length
+    String w[0]
+
+  compileFilter = (pattern) ->
+    text = String(pattern ? '')
+    return null unless text.length
+    try
+      new RegExp text
+    catch
+      # Invalid regex matches nothing (client should also surface the error).
+      { test: -> false }
+
+  # True if entity id or any leaf component-field value (stringified) matches re.
+  entityMatchesSearch = (row, re) ->
+    return true if re.test String(row.id ? '')
+    walk = (v) ->
+      return false unless v?
+      if Array.isArray v
+        return v.some walk
+      if typeof v is 'object'
+        return (Object.values v).some walk
+      re.test String v
+    walk row.doc ? {}
+
+  compareCellText = (a, b, dir = 'asc') ->
+    sa = String(a ? '')
+    sb = String(b ? '')
+    na = Number sa
+    nb = Number sb
+    if sa isnt '' and sb isnt '' and Number.isFinite(na) and Number.isFinite(nb) and String(na) is sa.trim() and String(nb) is sb.trim()
+      cmp = if na < nb then -1 else if na > nb then 1 else 0
+    else
+      cmp = sa.localeCompare sb, undefined, { numeric: true, sensitivity: 'base' }
+    if dir is 'desc' then -cmp else cmp
+
+  # Load / filter / sort the full activity source, then window. User sortPath and
+  # column filters take precedence over a stage's optional sort() comparator.
+  queryEntities = (activity, opts = {}) ->
+    q = opts.q or null
+    # Load full set without SQL ILIKE — global search is regex over field values.
+    rows = await store.window activity.source, { offset: 0, limit: 1000000 }
+    if q
+      re = compileFilter q
+      if re?
+        rows = rows.filter (row) -> entityMatchesSearch row, re
+    filters = opts.filters ? []
+    if filters.length
+      rows = rows.filter (row) ->
+        filters.every (f) ->
+          re = compileFilter f.re
+          return true unless re?
+          re.test cellText row.doc, f.path
+    sortPath = opts.sortPath or opts.sortField or null
+    dir = opts.dir ? 'asc'
+    if sortPath
+      # Explicit user (or field) sort — never defer to stage.sort.
+      rows = rows.slice().sort (x, y) ->
+        cmp = compareCellText cellText(x.doc, sortPath), cellText(y.doc, sortPath), dir
+        return cmp if cmp isnt 0
+        String(x.id).localeCompare String(y.id)
+    else if opts.sortStage
+      # Stage default sort only when the user has not chosen a value path.
+      stageSlug = opts.sortStage
+      mod = try await stages.load stageSlug catch then null
+      if mod?.sort?
+        rows = rows.slice().sort (x, y) ->
+          cmp = mod.sort x.doc, y.doc
+          cmp = -cmp if dir is 'desc'
+          return cmp if cmp isnt 0
+          String(x.id).localeCompare String(y.id)
+      else
+        writePath = await resolveWritesPath stageSlug
+        if writePath
+          rows = rows.slice().sort (x, y) ->
+            cmp = compareCellText cellText(x.doc, writePath), cellText(y.doc, writePath), dir
+            return cmp if cmp isnt 0
+            String(x.id).localeCompare String(y.id)
+        else if dir is 'desc'
+          rows = rows.slice().reverse()
+    else if dir is 'desc'
+      rows = rows.slice().reverse()
+    total = rows.length
+    offset = Math.max 0, opts.offset | 0
+    limit = Math.max 0, opts.limit | 0
+    { total, offset, rows: rows.slice(offset, offset + limit) }
+
+  # order ids for a source per sort spec (run/range and other callers)
   orderedIds = (activity, sort = null) ->
-    if sort?.stage
-      mod = await stages.load sort.stage
-      if typeof mod?.sort is 'function'
-        rows = await store.window activity.source, { offset: 0, limit: 1000000 }
-        rows.sort (x, y) -> mod.sort(x.doc, y.doc) * (if sort.dir is 'desc' then -1 else 1)
-        return (r.id for r in rows)
-    if sort?.field
-      rows = await store.window activity.source, { offset: 0, limit: 1000000, orderPath: sort.field, dir: sort.dir }
-      return (r.id for r in rows)
-    await store.allIds activity.source, sort?.dir ? 'asc'
+    result = await queryEntities activity, {
+      sortPath: sort?.field ? null
+      sortStage: sort?.stage ? null
+      dir: sort?.dir ? 'asc'
+    }
+    (r.id for r in result.rows)
 
   handle = (req) ->
     url = new URL req.url
@@ -170,8 +291,13 @@ export startServer = (opts = {}) ->
 
     # ---- websocket upgrade ----
     if p is '/ws/run'
-      return undefined if server.upgrade req
+      return undefined if server.upgrade req, data: { kind: 'run' }
       return new Response 'upgrade failed', status: 400
+    if p is '/__m_hmr'
+      return undefined if server.upgrade req, data: { kind: 'hmr' }
+      return new Response 'upgrade failed', status: 400
+    if p is '/__m_health'
+      return json { ok: true, hmrClients: hmrClients.size, runClients: sockets.size }
 
     # ---- chat (angela) ----
     if p.startsWith '/api/chat'
@@ -207,22 +333,42 @@ export startServer = (opts = {}) ->
     if p is '/api/entities' and req.method is 'GET'
       a = resolveActivity url.searchParams.get('activity')
       sortStage = url.searchParams.get 'sortStage'
+      # sortPath is the preferred user-driven key; sortField kept as alias.
+      sortPath = url.searchParams.get('sortPath') or url.searchParams.get('sortField') or null
       sortField = url.searchParams.get 'sortField'
       dir = url.searchParams.get('dir') ? 'asc'
       offset = Number(url.searchParams.get('offset') ? 0)
       limit = Math.min 500, Number(url.searchParams.get('limit') ? 100)
       q = url.searchParams.get('q') or null
-      total = await store.count a.source, q
-      if sortStage or sortField
-        ids = await orderedIds a, { stage: sortStage, field: sortField, dir }
-        ids = ids.slice offset, offset + limit
-        rows = []
-        for id in ids
-          rows.push { id, doc: await store.get(a.source, id) }
+      filterPaths = url.searchParams.getAll 'filterPath'
+      filterRes = url.searchParams.getAll 'filterRe'
+      filters = []
+      for fpath, i in filterPaths when fpath
+        filters.push { path: fpath, re: filterRes[i] ? '' }
+      # Always go through queryEntities when sorting, filtering, or searching so
+      # user A–Z / regex prefs apply uniformly (stage.sort is default-only).
+      if sortPath or sortField or sortStage or filters.length or q or dir is 'desc'
+        result = await queryEntities a, {
+          offset, limit, q, dir
+          sortPath: sortPath or sortField or null
+          sortStage: if sortPath or sortField then null else sortStage
+          filters
+        }
+        total = result.total
+        offset = result.offset
+        rows = result.rows
       else
+        total = await store.count a.source, q
         rows = await store.window a.source, { offset, limit, dir, q }
       df = displayFields a.source
-      rows = ({ id: r.id, doc: r.doc, label: E.labelFor(r.id, r.doc, df) } for r in rows)
+      rows = for r in rows
+        file = E.fileFor a.source, r.id
+        {
+          id: r.id
+          doc: r.doc
+          label: E.labelFor r.id, r.doc, df
+          file: file ? null
+        }
       return json { total, offset, rows }
 
     if p is '/api/fields'
@@ -481,11 +627,19 @@ export startServer = (opts = {}) ->
 
     # ---- static SPA ----
     fp = if p is '/' then '/index.html' else p
-    file = path.join PUBLIC, path.normalize(fp).replace(/^([.\\/])+/, '')
+    file = path.join PUBLIC, path.normalize(fp).replace(/^([.\/])+/, '')
     if file.startsWith(PUBLIC) and fs.existsSync(file) and fs.statSync(file).isFile()
-      return new Response Bun.file(file), headers: { 'content-type': MIME[path.extname file] ? 'application/octet-stream' }
+      ext = path.extname file
+      headers =
+        'content-type': MIME[ext] ? 'application/octet-stream'
+        # Dev-friendly: avoid sticky ES module / CSS caches during HMR
+        'cache-control': 'no-store'
+      return new Response Bun.file(file), { headers }
     # SPA fallback (hash routing → index)
-    return new Response Bun.file(path.join PUBLIC, 'index.html'), headers: { 'content-type': 'text/html' }
+    return new Response Bun.file(path.join PUBLIC, 'index.html'), headers: {
+      'content-type': 'text/html'
+      'cache-control': 'no-store'
+    }
 
   server = Bun.serve
     port: ws.port
@@ -498,10 +652,16 @@ export startServer = (opts = {}) ->
         json { error: String(err?.message ? err) }, 500
     websocket:
       open: (sock) ->
+        if sock.data?.kind is 'hmr'
+          hmrClients.add sock
+          sock.send JSON.stringify { type: 'connected', version: 'sheets-hmr' }
+          return
         sockets.add sock
         sock.send JSON.stringify engine.snapshot()
         sock.send JSON.stringify { type: 'cells', cells: engine.cellStates() }
-      close: (sock) -> sockets.delete sock
+      close: (sock) ->
+        if sock.data?.kind is 'hmr' then hmrClients.delete sock
+        else sockets.delete sock
       message: (sock, msg) -> null
 
   CFG.writeServerJson ws, { port: ws.port, pid: process.pid, started: Date.now() }
@@ -513,4 +673,5 @@ export startServer = (opts = {}) ->
   process.on 'SIGTERM', -> cleanup(); process.exit 0
 
   console.log "sheets serving #{ws.root} (db: #{ws.db}) on http://localhost:#{ws.port}"
+  console.log "sheets HMR ws://localhost:#{ws.port}/__m_hmr (watching public/)"
   { server, ws, store, engine, stages, activities, stop: -> cleanup(); server.stop(true) }

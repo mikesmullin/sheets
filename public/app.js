@@ -3,6 +3,7 @@
 // cells (Γ), selection (Ι), activity tabs (Δ), queue (Ζ), slider (Η), run log (Μ),
 // Angela chat (Ε/Θ). Stage focus mode (§9) at #/stage/<slug>.
 import M from './m.js'
+import './hot-client.js'
 
 const ROWH = 28
 const MIN_ROW_HEIGHT = 22
@@ -27,7 +28,8 @@ const normalizeColWidth = (width) => {
   return Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, n))
 }
 
-M.mount('#app', () => ({
+function createApp() {
+  return {
   // ---- state ----
   meta: null, actSlug: null, total: 0, rows: [], winStart: 0, fields: [], fieldTree: [], stageTree: [], componentLocks: {},
   sel: { ranges: [], active: null, anchor: null },
@@ -38,6 +40,9 @@ M.mount('#app', () => ({
   logs: [], conc: 0, dragging: null,
   persistTimers: {},
   logPinned: true, logWrap: false,
+  logFilterDraft: '', // live input in log header
+  logFilterRe: '', // applied regex source (empty = show all)
+  _logFilterDebounce: null,
   _logProgrammaticScroll: false, _logStickPending: false,
   sidebarWidth: 0, logHeight: 180, resizing: false,
   colResize: null, // { ci, width, startX, startW, moved }
@@ -54,8 +59,15 @@ M.mount('#app', () => ({
   editing: null, // {r, ci, value, x, y, w}
   renaming: null, // {id, value}
   magicInput: {}, fieldColumnEdit: null, // ci -> draft prompt / {ci, value}
-  sort: null, // {ci, dir}
-  search: '',
+  sort: null, // {ci, dir: 'asc'|'desc'} — user A–Z / Z–A; overrides stage.sort
+  colFilters: {}, // ci -> regex string (applied server-side on column values)
+  filterMenu: null, // { ci } when open
+  filterDraft: '', // live input in open filter menu
+  _filterDebounce: null,
+  _colValuePath: {}, // ci -> resolved field path (field or stage writes[0])
+  search: '', // applied global regex (empty = no search)
+  searchDraft: '', // live toolbar search input
+  _searchDebounce: null,
   focus: null, // {slug, source, meta, results, busy}
   toast: '', tabMenu: null, tabRename: null,
   fieldMenu: false,
@@ -103,6 +115,7 @@ M.mount('#app', () => ({
     this.chat.enabled = this.meta.chat
     if (this.chat.enabled) await this.loadChatConfig()
     if (!this.actSlug) this.actSlug = this.meta.activities[0]?.slug ?? null
+    this._colValuePath = {}
     await this.refreshWindow(resetWindow)
     const [fieldData, stageData] = await Promise.all([
       fetch(`/api/fields?activity=${this.actSlug}`).then((response) => response.json()),
@@ -143,14 +156,99 @@ M.mount('#app', () => ({
   },
 
   // ---- window / virtualization (Γ) ----
-  entityParams(offset, limit) {
-    const params = new URLSearchParams({ activity: this.actSlug ?? '', offset, limit })
+  // Resolve the field path a column sorts/filters on. Field columns use their
+  // path; stage columns use meta.writes[0]. User sort/filter always keys off
+  // this path so stage.sort() is only a default when the user has not chosen.
+  async valuePathForColumn(ci) {
+    const col = this.columns[ci]
+    if (!col) return null
+    if (col.field) return col.field
+    if (col.stage) {
+      if (this._colValuePath[ci]) return this._colValuePath[ci]
+      const path = await this.stageWritePath(col.stage)
+      if (path) this._colValuePath[ci] = path
+      return path
+    }
+    return null
+  },
+  onSearchInput(value) {
+    this.searchDraft = value
+    this.applySearchDraft(value, { immediate: false })
+  },
+  applySearchDraft(value, { immediate = false } = {}) {
+    if (this._searchDebounce) {
+      clearTimeout(this._searchDebounce)
+      this._searchDebounce = null
+    }
+    const run = async () => {
+      this._searchDebounce = null
+      const text = String(value ?? '')
+      if (text) {
+        try { new RegExp(text) } catch {
+          this.showToast('invalid regex')
+          return
+        }
+      }
+      if ((this.search || '') === text) return
+      const id = 'sheets-search-input'
+      const active = document.activeElement
+      const keepFocus = active?.id === id
+      const selStart = keepFocus ? active.selectionStart : null
+      const selEnd = keepFocus ? active.selectionEnd : null
+      this.search = text
+      await this.refreshWindow(true)
+      M.redraw()
+      if (keepFocus) {
+        const restore = () => {
+          const input = document.getElementById(id)
+          if (!input) return
+          if (document.activeElement !== input) input.focus()
+          try {
+            if (selStart != null && selEnd != null) input.setSelectionRange(selStart, selEnd)
+          } catch { /* ignore */ }
+        }
+        restore()
+        requestAnimationFrame(restore)
+      }
+    }
+    if (immediate) run()
+    else this._searchDebounce = setTimeout(run, 500)
+  },
+  clearSearch() {
+    if (this._searchDebounce) {
+      clearTimeout(this._searchDebounce)
+      this._searchDebounce = null
+    }
+    this.searchDraft = ''
+    this.applySearchDraft('', { immediate: true })
+    M.redraw()
+    requestAnimationFrame(() => document.getElementById('sheets-search-input')?.focus())
+  },
+  async entityParams(offset, limit) {
+    const params = new URLSearchParams({ activity: this.actSlug ?? '', offset: String(offset), limit: String(limit) })
     if (this.search) params.set('q', this.search)
     if (this.sort) {
-      const col = this.columns[this.sort.ci]
-      if (col?.stage) params.set('sortStage', col.stage)
-      else if (col?.field) params.set('sortField', col.field)
-      params.set('dir', this.sort.dir)
+      const path = await this.valuePathForColumn(this.sort.ci)
+      if (path) {
+        // Explicit user A–Z / Z–A — server must not fall back to stage.sort.
+        params.set('sortPath', path)
+        params.set('dir', this.sort.dir)
+      } else {
+        const col = this.columns[this.sort.ci]
+        if (col?.stage) params.set('sortStage', col.stage)
+        else if (col?.field) params.set('sortField', col.field)
+        params.set('dir', this.sort.dir)
+      }
+    }
+    // Per-column regex filters (AND). Empty / invalid patterns are skipped client-side.
+    for (const [ciKey, pattern] of Object.entries(this.colFilters ?? {})) {
+      const text = String(pattern ?? '')
+      if (!text) continue
+      try { new RegExp(text) } catch { continue }
+      const path = await this.valuePathForColumn(Number(ciKey))
+      if (!path) continue
+      params.append('filterPath', path)
+      params.append('filterRe', text)
     }
     return params
   },
@@ -161,7 +259,7 @@ M.mount('#app', () => ({
     this._windowRequest = request
     const visible = Math.ceil((el?.clientHeight ?? 600) / ROWH) + 20
     const start = Math.max(0, Math.floor(scrollTop / ROWH) - 10)
-    const params = this.entityParams(start, visible)
+    const params = await this.entityParams(start, visible)
     const data = await (await fetch(`/api/entities?${params}`)).json()
     if (request !== this._windowRequest) return
     this.total = data.total
@@ -483,14 +581,36 @@ M.mount('#app', () => ({
   },
   get selReadout() {
     if (!this.sel.ranges.length) return ''
-    const parts = this.sel.ranges.map((g) => {
+    return this.sel.ranges.map((g) => {
       const whole = g.r0 === 0 && g.r1 >= this.total - 1
       const a = `${colLetter(g.c0)}${whole ? '' : g.r0 + 1}`
       const b = `${colLetter(g.c1)}${whole ? '' : g.r1 + 1}`
       return a === b ? a : `${a}:${b}`
-    })
-    const n = this.runnableCount()
-    return `${parts.join(',')} — ${n} runnable cell${n === 1 ? '' : 's'}`
+    }).join(',')
+  },
+  get entityCountLabel() {
+    const n = this.total ?? 0
+    return `${n} entit${n === 1 ? 'y' : 'ies'}`
+  },
+  async copySelReadout() {
+    const text = this.selReadout
+    if (!text) return this.showToast('nothing selected')
+    try {
+      await navigator.clipboard.writeText(text)
+      this.showToast(`copied ${text}`)
+    } catch {
+      this.showToast('clipboard copy failed')
+    }
+  },
+  async copyEntityPath(row) {
+    const text = row?.file || (this.act?.source && row?.id ? `${this.act.source}/${row.id}.yaml` : row?.id)
+    if (!text) return this.showToast('no entity path')
+    try {
+      await navigator.clipboard.writeText(text)
+      this.showToast(`copied ${text}`)
+    } catch {
+      this.showToast('clipboard copy failed')
+    }
   },
   runnableCount() {
     let n = 0
@@ -741,6 +861,171 @@ M.mount('#app', () => ({
     await this.chatSend(text, { stage: slug, newSession: true })
   },
 
+  // Alt-click letter header cycles asc → desc → off (legacy shortcut).
+  toggleSort(ci) {
+    if (this.sort?.ci === ci) this.sort = this.sort.dir === 'asc' ? { ci, dir: 'desc' } : null
+    else this.sort = { ci, dir: 'asc' }
+    this.refreshWindow(true)
+  },
+  // Explicit A–Z / Z–A from the filter menu — always user-driven value sort.
+  setSort(ci, dir) {
+    if (dir !== 'asc' && dir !== 'desc') return
+    this.sort = { ci, dir }
+    this.filterMenu = null
+    this.refreshWindow(true)
+    M.redraw()
+  },
+  clearSort(ci) {
+    if (this.sort?.ci === ci) this.sort = null
+    this.filterMenu = null
+    this.refreshWindow(true)
+    M.redraw()
+  },
+  columnHasFilter(ci) {
+    return !!(this.colFilters?.[ci] && String(this.colFilters[ci]).length)
+  },
+  openFilterMenu(ci, e) {
+    e?.stopPropagation?.()
+    e?.preventDefault?.()
+    if (this.filterMenu?.ci === ci) {
+      this.closeFilterMenu()
+      return
+    }
+    // Switching columns: flush the previous draft first.
+    if (this.filterMenu && this.filterMenu.ci !== ci) {
+      if (this._filterDebounce) {
+        clearTimeout(this._filterDebounce)
+        this._filterDebounce = null
+      }
+      this.applyFilterDraft(this.filterMenu.ci, this.filterDraft, { immediate: true })
+    }
+    this.filterMenu = { ci }
+    this.filterDraft = this.colFilters?.[ci] ?? ''
+    this._bindFilterMenuOutside()
+    M.redraw()
+    setTimeout(() => document.querySelector('.col-filter-menu input.filter-re')?.focus(), 0)
+  },
+  _bindFilterMenuOutside() {
+    // m-js @click.outside calls the handler without `this`, so we bind our own
+    // document listener while the menu is open.
+    if (this._filterOutsideBound) return
+    this._filterOutsideBound = true
+    this._onFilterOutside = (ev) => {
+      if (!this.filterMenu) return
+      const t = ev.target
+      // One menu node exists per column (x-for); do not querySelector the first hidden one.
+      if (t?.closest?.('.col-filter-menu') || t?.closest?.('.filter-btn')) return
+      this.closeFilterMenu()
+    }
+    // next tick so the opening click does not immediately close
+    setTimeout(() => {
+      if (this.filterMenu) document.addEventListener('click', this._onFilterOutside, true)
+    }, 0)
+  },
+  _unbindFilterMenuOutside() {
+    if (!this._filterOutsideBound) return
+    document.removeEventListener('click', this._onFilterOutside, true)
+    this._filterOutsideBound = false
+    this._onFilterOutside = null
+  },
+  closeFilterMenu() {
+    if (!this.filterMenu) return
+    if (this._filterDebounce) {
+      clearTimeout(this._filterDebounce)
+      this._filterDebounce = null
+    }
+    // Flush any pending draft before close so a quick close still applies.
+    this.applyFilterDraft(this.filterMenu.ci, this.filterDraft, { immediate: true })
+    this.filterMenu = null
+    this._unbindFilterMenuOutside()
+    M.redraw()
+  },
+  onFilterDraftInput(ci, value) {
+    this.filterDraft = value
+    this.applyFilterDraft(ci, value, { immediate: false })
+  },
+  applyFilterDraft(ci, value, { immediate = false } = {}) {
+    if (this._filterDebounce) {
+      clearTimeout(this._filterDebounce)
+      this._filterDebounce = null
+    }
+    const run = async () => {
+      this._filterDebounce = null
+      const text = String(value ?? '')
+      const next = { ...this.colFilters }
+      if (!text) delete next[ci]
+      else {
+        try {
+          new RegExp(text)
+          next[ci] = text
+        } catch {
+          // Keep draft visible but don't apply invalid regex (would hide all rows).
+          this.showToast('invalid regex')
+          return
+        }
+      }
+      const prev = this.colFilters?.[ci] ?? ''
+      const applied = next[ci] ?? ''
+      if (prev === applied) return
+      // m-js redraw restores focus only by id/name — give the filter input a stable id.
+      const id = `sheets-col-filter-${ci}`
+      const active = document.activeElement
+      const keepFocus = active?.id === id || (active?.classList?.contains('filter-re') && this.filterMenu?.ci === ci)
+      const selStart = keepFocus ? active.selectionStart : null
+      const selEnd = keepFocus ? active.selectionEnd : null
+      this.colFilters = next
+      // Keep grid scroll when filtering from the open menu.
+      await this.refreshWindow(this.filterMenu?.ci === ci ? false : true)
+      M.redraw()
+      if (keepFocus && this.filterMenu?.ci === ci) {
+        const restore = () => {
+          const input = document.getElementById(id)
+          if (!input || this.filterMenu?.ci !== ci) return
+          if (document.activeElement !== input) input.focus()
+          try {
+            if (selStart != null && selEnd != null) input.setSelectionRange(selStart, selEnd)
+          } catch { /* ignore */ }
+        }
+        restore()
+        requestAnimationFrame(restore)
+      }
+    }
+    if (immediate) run()
+    else this._filterDebounce = setTimeout(run, 500)
+  },
+  clearFilterInput(ci) {
+    if (this._filterDebounce) {
+      clearTimeout(this._filterDebounce)
+      this._filterDebounce = null
+    }
+    this.filterDraft = ''
+    this.applyFilterDraft(ci, '', { immediate: true })
+    M.redraw() // hide the × even when no applied filter changed
+    // Keep menu open and put caret back in the field.
+    requestAnimationFrame(() => {
+      const input = document.getElementById(`sheets-col-filter-${ci}`)
+      if (input && this.filterMenu?.ci === ci) input.focus()
+    })
+  },
+  clearColumnFilter(ci) {
+    if (this._filterDebounce) {
+      clearTimeout(this._filterDebounce)
+      this._filterDebounce = null
+    }
+    this.filterDraft = ''
+    if (!this.colFilters?.[ci]) {
+      this.filterMenu = null
+      M.redraw()
+      return
+    }
+    const next = { ...this.colFilters }
+    delete next[ci]
+    this.colFilters = next
+    this.filterMenu = null
+    this.refreshWindow(true)
+    M.redraw()
+  },
+
   // ---- run bar ----
   async play() {
     if (!this.sel.ranges.length) return this.showToast('nothing selected')
@@ -750,11 +1035,6 @@ M.mount('#app', () => ({
     else this.showToast(`enqueued ${r.added}`)
   },
   async stopAll() { await fetch('/api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ all: true }) }) },
-  toggleSort(ci) {
-    if (this.sort?.ci === ci) this.sort = this.sort.dir === 'asc' ? { ci, dir: 'desc' } : null
-    else this.sort = { ci, dir: 'asc' }
-    this.refreshWindow(true)
-  },
 
   // ---- rows (filesystem entities) ----
   async addRow() {
@@ -783,7 +1063,8 @@ M.mount('#app', () => ({
     for (const range of this.selectedRowRanges()) {
       for (let offset = range.start; offset <= range.end; offset += 500) {
         const limit = Math.min(500, range.end - offset + 1)
-        const data = await (await fetch(`/api/entities?${this.entityParams(offset, limit)}`)).json()
+        const params = await this.entityParams(offset, limit)
+        const data = await (await fetch(`/api/entities?${params}`)).json()
         data.rows.forEach((row, index) => rows.set(offset + index, row))
       }
     }
@@ -912,6 +1193,10 @@ M.mount('#app', () => ({
     const prev = columns[edit.ci] ?? {}
     columns[edit.ci] = prev.width != null ? { field, width: prev.width } : { field }
     if (!await this.patchColumns(columns)) return
+    this.filterMenu = null
+    this.sort = null
+    this.colFilters = {}
+    this._colValuePath = {}
     M.redraw()
     this.showToast(`saved ${field}`)
   },
@@ -1082,9 +1367,63 @@ M.mount('#app', () => ({
       this.logPinned = this.isLogNearBottom(el)
     })
   },
+  logPlainText(ev) {
+    const ts = new Date(ev.ts).toTimeString().slice(0, 8)
+    return `${ts} ${ev.stage ?? ''} ${ev.entity ?? ''} ${ev.line ?? ''}`
+  },
   logHtml(ev) {
     const ts = new Date(ev.ts).toTimeString().slice(0, 8)
     return `<span class="ts">${ts}</span> <span style="color:${hashColor(ev.stage)}">${esc(ev.stage)}</span> <span style="color:${hashColor(ev.entity)}">${esc(ev.entity)}</span> ${esc(ev.line)}`
+  },
+  onLogFilterInput(value) {
+    this.logFilterDraft = value
+    this.applyLogFilter(value, { immediate: false })
+  },
+  clearLogFilter() {
+    if (this._logFilterDebounce) {
+      clearTimeout(this._logFilterDebounce)
+      this._logFilterDebounce = null
+    }
+    this.logFilterDraft = ''
+    this.applyLogFilter('', { immediate: true })
+    M.redraw()
+    requestAnimationFrame(() => document.getElementById('sheets-log-filter-input')?.focus())
+  },
+  applyLogFilter(value, { immediate = false } = {}) {
+    if (this._logFilterDebounce) {
+      clearTimeout(this._logFilterDebounce)
+      this._logFilterDebounce = null
+    }
+    const run = () => {
+      this._logFilterDebounce = null
+      const text = String(value ?? '')
+      if (text) {
+        try {
+          new RegExp(text)
+        } catch {
+          // Keep draft visible but don't apply invalid regex (would hide all lines).
+          this.showToast('invalid regex')
+          return
+        }
+      }
+      if ((this.logFilterRe ?? '') === text) return
+      this.logFilterRe = text
+      M.redraw()
+      this.scheduleLogStick()
+    }
+    if (immediate) run()
+    else this._logFilterDebounce = setTimeout(run, 1000)
+  },
+  get visibleLogs() {
+    const src = this.logFilterRe ?? ''
+    if (!src) return this.logs
+    let re
+    try {
+      re = new RegExp(src)
+    } catch {
+      return this.logs
+    }
+    return this.logs.filter((ev) => re.test(this.logPlainText(ev)))
   },
 
   // ---- queue bar (Ζ) + slider (Η) ----
@@ -1446,7 +1785,7 @@ M.mount('#app', () => ({
   chatTelemetryHtml(message) {
     const t = message?.telemetry
     if (!t) return ''
-    const chip = (icon, text) => `<span class="metric-chip"><i class="ph ${icon}" aria-hidden="true"></i><span>${esc(text)}</span></span>`
+    const chip = (icon, text) => `<span class="metric-chip"><i class="ph-bold ${icon}" aria-hidden="true"></i><span>${esc(text)}</span></span>`
     const chips = []
     if (t.tokPerSec != null && Number.isFinite(Number(t.tokPerSec))) chips.push(chip('ph-gauge', `${Number(t.tokPerSec).toFixed(2)} tps`))
     const tokenCount = t.completionTokens ?? t.estimatedTokens
@@ -1591,7 +1930,10 @@ M.mount('#app', () => ({
         <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : '')" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : 'disconnected from sheets server')" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span><button class="refresh-button" @click="refreshPersistent()" title="reload persistent files">↻</button>
         <span x-text="meta ? meta.root.split('/').pop() : ''" style="color:var(--dim)"></span>
         <div class="dropdown" @click.outside="fieldMenu = false">
-          <button @click="fieldMenu = !fieldMenu">columns ▾</button>
+          <button class="toolbar-icon-btn toolbar-dropdown-btn" @click="fieldMenu = !fieldMenu" title="columns">
+            <i class="ph-bold ph-table" aria-hidden="true"></i>
+            <i class="ph-fill ph-caret-down toolbar-dropdown-caret" aria-hidden="true"></i>
+          </button>
           <div class="menu" x-show="fieldMenu">
             <div class="column-group-heading">Stages</div>
             <label class="stage-toggle" x-for="stage in stageTree" :key="stage.slug">
@@ -1612,13 +1954,40 @@ M.mount('#app', () => ({
             </div>
           </div>
         </div>
-        <button @click="addRow()" title="create a new entity YAML row">+ row</button>
-        <button @click="deleteRows()" title="delete rows included in the selection">− row</button>
-        <button @click="insertColumn()" title="insert stage column after cursor">+ col</button>
-        <button @click="deleteColumn()" title="delete column at cursor">− col</button>
-        <input placeholder="search…" x-model="search" @keydown="if ($event.key === 'Enter') refreshWindow(true)" style="width:130px">
-        <button class="primary" @click="play()" title="run selection">▶ play</button>
-        <span class="sel-readout" x-text="selReadout"></span>
+        <div class="toolbar-group" title="rows">
+          <span class="toolbar-group-label" aria-hidden="true"><i class="ph-bold ph-rows"></i></span>
+          <button class="toolbar-icon-btn" @click="addRow()" title="create a new entity YAML row">
+            <i class="ph-bold ph-plus-circle" aria-hidden="true"></i>
+          </button>
+          <button class="toolbar-icon-btn" @click="deleteRows()" title="delete rows included in the selection">
+            <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div class="toolbar-group" title="columns">
+          <span class="toolbar-group-label" aria-hidden="true"><i class="ph-bold ph-columns"></i></span>
+          <button class="toolbar-icon-btn" @click="insertColumn()" title="insert stage column after cursor">
+            <i class="ph-bold ph-plus-circle" aria-hidden="true"></i>
+          </button>
+          <button class="toolbar-icon-btn" @click="deleteColumn()" title="delete column at cursor">
+            <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div class="search-wrap" :class="(searchDraft ? 'on ' : '') + (searchDraft ? 'has-clear' : '')"
+          title="search entities (regex over all field values)">
+          <i class="ph-bold ph-magnifying-glass search-icon" aria-hidden="true"></i>
+          <input class="search-input" id="sheets-search-input" type="text" placeholder="search…" spellcheck="false"
+            :value="searchDraft"
+            @input="onSearchInput($event.target.value)"
+            @keydown="if ($event.key === 'Escape') { $event.preventDefault(); clearSearch() }
+              else if ($event.key === 'Enter') { $event.preventDefault(); applySearchDraft(searchDraft, { immediate: true }) }">
+          <button type="button" class="field-clear" x-show="searchDraft" @click="clearSearch()" title="clear search">
+            <i class="ph-bold ph-x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection">
+          <i class="ph-bold ph-play" aria-hidden="true"></i>
+        </button>
+        <span class="entity-count" x-text="entityCountLabel"></span>
       </div>
 
       <div class="focus" x-show="focus">
@@ -1653,7 +2022,15 @@ M.mount('#app', () => ({
         <table class="grid" :class="(colResize ? 'col-resizing ' : '') + (rowResize ? 'row-resizing' : '')">
           <thead>
             <tr>
-              <th class="corner rowhead"><span style="color:var(--dim)" x-text="total + ' rows'"></span></th>
+              <th class="corner rowhead">
+                <div class="corner-sel">
+                  <span class="sel-readout" x-text="selReadout"></span>
+                  <button class="sel-copy" type="button" :class="selReadout ? 'has-text' : ''"
+                    @click.stop="copySelReadout()" title="copy selection range">
+                    <i class="ph-bold ph-copy" aria-hidden="true"></i>
+                  </button>
+                </div>
+              </th>
               <th class="colhead col-resizable" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :class="colSelected(ci) ? 'selected-head' : ''" :style="colStyle(ci)" @click="colHeadClick(ci, $event)"
                 :title="'click: select column · alt-click: sort · drag edge: resize'">
                 <span class="letter" x-text="colLetter(ci)"></span>
@@ -1663,7 +2040,9 @@ M.mount('#app', () => ({
             </tr>
             <tr class="magic">
               <th class="rowhead"></th>
-              <th class="col-resizable" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :style="colStyle(ci)">
+              <th class="col-resizable" x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci"
+                :class="(columnHasFilter(ci) || (sort && sort.ci === ci) ? 'col-filtered ' : '') + (filterMenu && filterMenu.ci === ci ? 'filter-open' : '')"
+                :style="colStyle(ci)">
                 <div class="magic-cell" :class="colRunning(ci) > 0 ? 'processing' : ''">
                   <input class="field-path-edit" x-show="col.field && fieldColumnEdit && fieldColumnEdit.ci === ci"
                     :value="fieldColumnEdit && fieldColumnEdit.ci === ci ? fieldColumnEdit.value : ''"
@@ -1678,10 +2057,42 @@ M.mount('#app', () => ({
                       @keydown="if ($event.key === 'Enter') magicSubmit(ci)">
                   </template>
                   <span class="actions">
-                    <button title="move column left" :disabled="ci === 0" @click.stop="moveColumn(ci, -1)">‹</button>
-                    <button title="move column right" :disabled="ci === columns.length - 1" @click.stop="moveColumn(ci, 1)">›</button>
-                    <button x-show="!col.stage && magicInput[ci]" @click="magicSubmit(ci)" title="send to Angela">✨</button>
+                    <button class="col-move" title="move column left" :disabled="ci === 0" @click.stop="moveColumn(ci, -1)">‹</button>
+                    <button class="col-move" title="move column right" :disabled="ci === columns.length - 1" @click.stop="moveColumn(ci, 1)">›</button>
+                    <button class="filter-btn"
+                      :class="(columnHasFilter(ci) || (sort && sort.ci === ci) ? 'on ' : '') + (columnHasFilter(ci) || (sort && sort.ci === ci) || (filterMenu && filterMenu.ci === ci) ? 'force-show' : '')"
+                      title="sort / filter column" @click.stop="openFilterMenu(ci, $event)">
+                      <i class="ph-bold ph-funnel" aria-hidden="true"></i>
+                    </button>
+                    <button class="angela-send" x-show="!col.stage && magicInput[ci]" @click="magicSubmit(ci)" title="send to Angela">✨</button>
                   </span>
+                  <div class="col-filter-menu" x-show="filterMenu && filterMenu.ci === ci" @click.stop>
+                    <div class="cfm-row sort-row">
+                      <span class="cfm-label"><i class="ph-bold ph-arrows-down-up" aria-hidden="true"></i>Sort:</span>
+                      <button type="button" class="cfm-sort" :class="sort && sort.ci === ci && sort.dir === 'asc' ? 'on' : ''"
+                        @click.stop="setSort(ci, 'asc')" title="sort ascending">
+                        <i class="ph-bold ph-sort-ascending" aria-hidden="true"></i>
+                      </button>
+                      <button type="button" class="cfm-sort" :class="sort && sort.ci === ci && sort.dir === 'desc' ? 'on' : ''"
+                        @click.stop="setSort(ci, 'desc')" title="sort descending">
+                        <i class="ph-bold ph-sort-descending" aria-hidden="true"></i>
+                      </button>
+                      <button type="button" class="cfm-clear" x-show="sort && sort.ci === ci" @click.stop="clearSort(ci)" title="clear sort">×</button>
+                    </div>
+                    <div class="cfm-label"><i class="ph-bold ph-funnel" aria-hidden="true"></i>Filter by value:</div>
+                    <div class="cfm-filter-row" :class="filterDraft ? 'has-clear' : ''">
+                      <input class="filter-re" type="text" placeholder="regex…" spellcheck="false"
+                        :id="'sheets-col-filter-' + ci"
+                        :value="filterMenu && filterMenu.ci === ci ? filterDraft : ''"
+                        @input="onFilterDraftInput(ci, $event.target.value)"
+                        @keydown="if ($event.key === 'Escape') { $event.preventDefault(); closeFilterMenu() }
+                          else if ($event.key === 'Enter') { $event.preventDefault(); applyFilterDraft(ci, filterDraft, { immediate: true }) }">
+                      <button type="button" class="field-clear" x-show="filterDraft"
+                        @click.stop="clearFilterInput(ci)" title="clear filter">
+                        <i class="ph-bold ph-x" aria-hidden="true"></i>
+                      </button>
+                    </div>
+                  </div>
                 </div>
                 <div class="col-resize" :class="colResize && colResize.ci === ci ? 'active' : ''" title="drag to resize column" @pointerdown="startColResize(ci, $event)"></div>
               </th>
@@ -1692,10 +2103,16 @@ M.mount('#app', () => ({
             <tr x-for="row, i in rows" :key="row.id" :data-row-id="row.id" :class="rowClass(row)" :style="rowStyle(row)">
               <td class="rowhead" :class="rowSelected(i) ? 'selected-head' : ''" @click="rowHeadClick(i, $event)">
                 <span class="rownum" x-text="winStart + i + 1"></span>
-                <input class="row-rename-input" x-show="renaming && renaming.id === row.id" x-model="renaming.value"
-                  @keydown="renameKey($event)" @blur="commitRename()" :title="row.id">
-                <span class="rowlabel" x-show="!renaming || renaming.id !== row.id" x-text="row.label" :title="row.id"
-                  @click.stop="startRename(i)"></span>
+                <span class="row-main">
+                  <input class="row-rename-input" x-show="renaming && renaming.id === row.id" x-model="renaming.value"
+                    @keydown="renameKey($event)" @blur="commitRename()" :title="row.file || row.id">
+                  <span class="rowlabel" x-show="!renaming || renaming.id !== row.id" x-text="row.label" :title="row.file || row.id"
+                    @click.stop="startRename(i)"></span>
+                  <button class="row-copy" type="button" x-show="row.id" @click.stop="copyEntityPath(row)"
+                    :title="'copy path: ' + (row.file || row.id)">
+                    <i class="ph-bold ph-copy" aria-hidden="true"></i>
+                  </button>
+                </span>
                 <div class="row-resize" :class="rowResize && rowResize.id === row.id ? 'active' : ''"
                   title="drag to resize row" @pointerdown="startRowResize(i, $event)"></div>
               </td>
@@ -1706,26 +2123,30 @@ M.mount('#app', () => ({
                 <div class="cell-inner" x-html="cellHtml(row, ci)"></div>
               </td>
             </tr>
-            <tr x-show="bottomPad > 0"><td :colspan="columns.length + 1" :style="'height:' + bottomPad + 'px;padding:0;border:0'"></td></tr>
-          </tbody>
-        </table>
-      </div>
+              <tr x-show="bottomPad > 0"><td :colspan="columns.length + 1" :style="'height:' + bottomPad + 'px;padding:0;border:0'"></td></tr>
+            </tbody>
+          </table>
+        </div>
 
-      <div class="tabs">
-        <div class="tab" x-for="a in (meta && meta.activities) || []" :key="a.slug"
-          :class="a.slug === actSlug ? 'on' : ''" @click="switchTab(a.slug)" @click.outside="tabMenu = null">
-          <input class="tab-rename-input" x-show="tabRename && tabRename.slug === a.slug"
-            :value="tabRename && tabRename.slug === a.slug ? tabRename.value : ''" @input="tabRename.value = $event.target.value"
-            @click.stop @keydown="tabRenameKey($event)" @blur="commitTabRename()">
-          <span class="tab-label" x-show="!tabRename || tabRename.slug !== a.slug" x-text="a.title"></span>
-          <button class="tab-menu" title="activity options" @click.stop="toggleTabMenu(a.slug)">⌄</button>
-          <div class="tab-context" x-show="tabMenu === a.slug">
-            <button @click.stop="deleteTab(a.slug)">delete</button>
+        <div class="tabs">
+          <div class="tab" x-for="a in (meta && meta.activities) || []" :key="a.slug"
+            :class="a.slug === actSlug ? 'on' : ''" @click="switchTab(a.slug)" @click.outside="tabMenu = null">
+            <input class="tab-rename-input" x-show="tabRename && tabRename.slug === a.slug"
+              :value="tabRename && tabRename.slug === a.slug ? tabRename.value : ''" @input="tabRename.value = $event.target.value"
+              @click.stop @keydown="tabRenameKey($event)" @blur="commitTabRename()">
+            <span class="tab-label" x-show="!tabRename || tabRename.slug !== a.slug" x-text="a.title"></span>
+            <button class="tab-menu" title="activity options" @click.stop="toggleTabMenu(a.slug)">
+              <i class="ph-fill ph-caret-down" aria-hidden="true"></i>
+            </button>
+            <div class="tab-context" x-show="tabMenu === a.slug">
+              <button @click.stop="deleteTab(a.slug)">delete</button>
+            </div>
+          </div>
+          <div class="tab add-tab" title="add activity" @click="addTab()">
+            <i class="ph-bold ph-plus" aria-hidden="true"></i>
           </div>
         </div>
-        <div class="tab add-tab" title="add activity" @click="addTab()">+</div>
       </div>
-    </div>
 
     <div class="sidebar" :class="resizing ? 'resizing' : ''" :style="sidebarStyle()">
       <div class="queuebox">
@@ -1738,11 +2159,16 @@ M.mount('#app', () => ({
         </div>
         <div class="qmeta">
           <span x-text="qSummary"></span>
-          <button class="queue-clear" @click="clearQueue()" :disabled="q.queued + q.idle + q.running + q.done + q.error === 0" title="clear queue">×</button>
-          <span x-text="'run:' + q.running + ' err:' + q.error"></span>
-          <span style="margin-left:auto">concurrency</span>
+          <button class="queue-clear" x-show="q.queued + q.idle + q.running + q.done + q.error > 0"
+            @click="clearQueue()" title="clear queue">
+            <i class="ph-bold ph-trash" aria-hidden="true"></i>
+          </button>
+          <span x-show="q.running > 0 || q.error > 0" x-text="(q.running > 0 ? 'run:' + q.running : '') + (q.running > 0 && q.error > 0 ? ' ' : '') + (q.error > 0 ? 'err:' + q.error : '')"></span>
+          <span class="conc-label" style="margin-left:auto" title="concurrency">
+            <i class="ph-bold ph-chat-teardrop-dots" aria-hidden="true"></i>
+          </span>
           <button class="queue-pause" x-show="q.running > 0" @click="pauseQueue()" title="pause queue">Ⅱ</button>
-          <div class="slider" @pointerdown="sliderDown($event)">
+          <div class="slider" title="concurrency" @pointerdown="sliderDown($event)">
             <div class="fill" :style="'width:' + Math.max(2, conc / 64 * 100) + '%'"></div>
             <div class="val" x-text="conc"></div>
           </div>
@@ -1750,21 +2176,33 @@ M.mount('#app', () => ({
       </div>
       <div class="loghead">
         <span class="loghead-label">log</span>
+        <div class="log-filter-wrap" :class="(logFilterDraft || logFilterRe ? 'on ' : '') + (logFilterDraft ? 'has-clear' : '')"
+          title="filter log lines by regular expression">
+          <i class="ph-bold ph-funnel log-filter-icon" aria-hidden="true"></i>
+          <input class="log-filter" id="sheets-log-filter-input" type="text" placeholder="filter…" spellcheck="false"
+            :value="logFilterDraft"
+            @input="onLogFilterInput($event.target.value)"
+            @keydown="if ($event.key === 'Escape') { $event.preventDefault(); clearLogFilter() }
+              else if ($event.key === 'Enter') { $event.preventDefault(); applyLogFilter(logFilterDraft, { immediate: true }) }">
+          <button type="button" class="field-clear" x-show="logFilterDraft" @click="clearLogFilter()" title="clear log filter">
+            <i class="ph-bold ph-x" aria-hidden="true"></i>
+          </button>
+        </div>
         <button class="log-wrap-btn" :class="logWrap ? 'on' : ''" @click="toggleLogWrap()"
           :title="logWrap ? 'disable word wrap' : 'enable word wrap'">
-          <i class="ph ph-paragraph" aria-hidden="true"></i>
+          <i class="ph-bold ph-paragraph" aria-hidden="true"></i>
         </button>
       </div>
       <div class="logbox" :class="logWrap ? 'wrap' : ''" :style="logStyle()" @scroll="logScroll($event)" @wheel="logWheel($event)">
-        <div class="logline" x-for="ev, i in logs" :key="i" x-html="logHtml(ev)"></div>
+        <div class="logline" x-for="ev, i in visibleLogs" :key="i" x-html="logHtml(ev)"></div>
       </div>
       <div class="sidebar-resize-h" title="resize log and chat" @pointerdown="startChatResize($event)"></div>
       <div class="chat">
         <div class="chat-header">
           <span class="chat-title">angela</span>
           <span class="chat-elapsed" x-show="chat.elapsed" x-text="chat.elapsed"></span>
-          <button class="chat-speaker" :class="chat.speak ? 'on' : ''" @click="toggleChatSpeak()" :title="chat.speak ? 'disable Ada voice output' : 'enable Ada voice output'"><i class="ph ph-speaker-high" aria-hidden="true"></i></button>
-          <button class="chat-stop" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph ph-stop" aria-hidden="true"></i></button>
+          <button class="chat-speaker" :class="chat.speak ? 'on' : ''" @click="toggleChatSpeak()" :title="chat.speak ? 'disable Ada voice output' : 'enable Ada voice output'"><i class="ph-bold ph-speaker-high" aria-hidden="true"></i></button>
+          <button class="chat-stop" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph-bold ph-stop" aria-hidden="true"></i></button>
         </div>
         <div class="chat-speak-warning" x-show="chat.speakWarning">Ada voice output is unavailable. Check that the <b>ada</b> command is installed.</div>
         <div class="disabled" x-show="!chat.enabled">Angela chat is off — run <b>sheets init</b> in this workspace to scaffold .angela/agents/angela.coffee, then restart the server.</div>
@@ -1774,7 +2212,7 @@ M.mount('#app', () => ({
             <div class="ev" x-for="e, j in m.events || []" :key="j" x-text="e"></div>
             <div class="body" x-show="m.who !== 'approval'" x-text="m.body"></div>
             <div class="approval-card" x-show="m.who === 'approval'">
-              <div class="approval-title"><i class="ph ph-warning" aria-hidden="true"></i><span>approval required</span></div>
+              <div class="approval-title"><i class="ph-bold ph-warning" aria-hidden="true"></i><span>approval required</span></div>
               <div class="approval-name" x-text="m.name"></div>
               <div class="approval-reason" x-text="m.reason"></div>
               <pre class="approval-command" x-show="m.command" x-text="m.command"></pre>
@@ -1786,8 +2224,8 @@ M.mount('#app', () => ({
             </div>
             <div class="msg-gutter">
               <div class="gutter-actions">
-                <button class="gutter-btn" @click="toggleChatMessageVisible(m)" :title="m.visible === false ? 'include message in context' : 'exclude message from context'"><i class="ph" :class="m.visible === false ? 'ph-eye-slash' : 'ph-eye'" aria-hidden="true"></i></button>
-                <button class="gutter-btn" :class="m.bookmarked ? 'on' : ''" @click="toggleChatMessageBookmark(m)" :title="m.bookmarked ? 'remove bookmark' : 'bookmark message'"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></button>
+                <button class="gutter-btn" @click="toggleChatMessageVisible(m)" :title="m.visible === false ? 'include message in context' : 'exclude message from context'"><i class="ph-bold" :class="m.visible === false ? 'ph-eye-slash' : 'ph-eye'" aria-hidden="true"></i></button>
+                <button class="gutter-btn" :class="m.bookmarked ? 'on' : ''" @click="toggleChatMessageBookmark(m)" :title="m.bookmarked ? 'remove bookmark' : 'bookmark message'"><i class="ph-bold ph-bookmark-simple" aria-hidden="true"></i></button>
               </div>
               <div class="chat-metrics" x-html="chatTelemetryHtml(m)"></div>
             </div>
@@ -1821,12 +2259,12 @@ M.mount('#app', () => ({
             <select class="chat-dd effort-dd" :value="chat.reasoningEffort" @change="chatEffortChange($event)" title="reasoning effort">
               <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
             </select>
-            <button class="chat-icon-btn" :class="chat.thinking ? 'on' : ''" @click="toggleChatThinking()" title="toggle model thinking"><i class="ph ph-brain" aria-hidden="true"></i></button>
+            <button class="chat-icon-btn" :class="chat.thinking ? 'on' : ''" @click="toggleChatThinking()" title="toggle model thinking"><i class="ph-bold ph-brain" aria-hidden="true"></i></button>
             <div class="context-meter" :style="'--context-pct:' + chatContextPct() + '%'" :title="chatContextTitle()"><span x-text="chatContextLabel()"></span></div>
-            <button class="chat-icon-btn" :class="chat.toolsOpen ? 'on' : ''" @click="toggleChatTools()" title="tools for inference"><i class="ph ph-wrench" aria-hidden="true"></i></button>
-            <button class="chat-icon-btn" :class="chat.allowlistOpen ? 'on' : ''" @click="toggleChatAllowlist()" title="allowlist"><i class="ph ph-shield-check" aria-hidden="true"></i></button>
-            <button class="chat-send chat-stop-inline" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph ph-stop" aria-hidden="true"></i></button>
-            <button class="chat-send primary" x-show="!chat.busy" @click="chatSend()" :disabled="!chat.input.trim()" title="send message"><i class="ph ph-paper-plane-right" aria-hidden="true"></i></button>
+            <button class="chat-icon-btn" :class="chat.toolsOpen ? 'on' : ''" @click="toggleChatTools()" title="tools for inference"><i class="ph-bold ph-wrench" aria-hidden="true"></i></button>
+            <button class="chat-icon-btn" :class="chat.allowlistOpen ? 'on' : ''" @click="toggleChatAllowlist()" title="allowlist"><i class="ph-bold ph-shield-check" aria-hidden="true"></i></button>
+            <button class="chat-send chat-stop-inline" x-show="chat.busy" @click="chatStop()" title="stop Angela"><i class="ph-bold ph-stop" aria-hidden="true"></i></button>
+            <button class="chat-send primary" x-show="!chat.busy" @click="chatSend()" :disabled="!chat.input.trim()" title="send message"><i class="ph-bold ph-paper-plane-right" aria-hidden="true"></i></button>
           </div>
         </div>
       </div>
@@ -1839,4 +2277,49 @@ M.mount('#app', () => ({
   </div>
   `,
   colLetter,
-}))
+  }
+}
+
+function patchApp(existing, next) {
+  if (!existing || !next) return existing
+  const descs = Object.getOwnPropertyDescriptors(next)
+  for (const [key, desc] of Object.entries(descs)) {
+    if (key === 'init') continue // keep first-boot listeners / WS
+    if (desc.get || desc.set) {
+      Object.defineProperty(existing, key, desc)
+    } else if (typeof desc.value === 'function') {
+      existing[key] = desc.value
+    } else if (key === 'template') {
+      existing.template = desc.value
+    } else if (!Object.prototype.hasOwnProperty.call(existing, key)) {
+      existing[key] = desc.value
+    }
+  }
+  return existing
+}
+
+async function boot(bust = 0) {
+  const next = createApp()
+  if (!window.__SHEETS_MOUNTED__) {
+    window.__SHEETS_MOUNTED__ = true
+    M.mount('#app', () => next)
+    console.info('[sheets] mounted')
+    return
+  }
+  const root = M.root
+  if (!root) {
+    M.mount('#app', () => next)
+    console.info('[sheets] remounted', bust)
+    return
+  }
+  patchApp(root, next)
+  M.redraw()
+  console.info('[sheets] hot reloaded', bust)
+}
+
+window.__M_BOOT__ = boot
+// First load boots here; HMR re-imports set __M_BOOT__ then hot-client calls it.
+if (!window.__SHEETS_HMR_BOOTSTRAPPED__) {
+  window.__SHEETS_HMR_BOOTSTRAPPED__ = true
+  await boot(0)
+}
