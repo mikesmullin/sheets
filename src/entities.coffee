@@ -56,8 +56,47 @@ export fileFor = (dbDir, id) ->
     return f if fs.existsSync f
   null
 
+# Nested set under an object for multi-segment paths (e.g. destination.permanent_space).
+export setAtPath = (root, dotPath, value) ->
+  parts = String(dotPath ? '').split('.').filter Boolean
+  return root unless parts.length and root? and typeof root is 'object' and not Array.isArray root
+  cur = root
+  for part, idx in parts
+    if idx is parts.length - 1
+      cur[part] = value
+    else
+      next = cur[part]
+      unless next? and typeof next is 'object' and not Array.isArray next
+        next = {}
+        cur[part] = next
+      cur = next
+  root
+
+# Nested delete; returns true when a key was removed. Prunes empty plain objects upward.
+export deleteAtPath = (root, dotPath) ->
+  parts = String(dotPath ? '').split('.').filter Boolean
+  return false unless parts.length and root? and typeof root is 'object' and not Array.isArray root
+  stack = []
+  cur = root
+  for part, idx in parts
+    return false unless cur? and typeof cur is 'object' and not Array.isArray cur
+    if idx is parts.length - 1
+      return false unless Object.prototype.hasOwnProperty.call cur, part
+      delete cur[part]
+      # Prune empty parents created only as containers (not the doc root).
+      for i in [stack.length - 1..0] by -1
+        { parent, key } = stack[i]
+        child = parent[key]
+        break unless child? and typeof child is 'object' and not Array.isArray(child) and Object.keys(child).length is 0
+        delete parent[key]
+      return true
+    stack.push { parent: cur, key: part }
+    cur = cur[part]
+  false
+
 # Shallow two-level merge (§4): component -> field. Field values REPLACE wholesale
 # (objects/arrays too); null is a value, never a deletion — fields accrue.
+# Field keys may contain dots (component-relative nested path) and are applied via setAtPath.
 export mergePatch = (doc, patch) ->
   return doc unless patch? and typeof patch is 'object' and not Array.isArray patch
   for comp, fields of patch
@@ -65,7 +104,10 @@ export mergePatch = (doc, patch) ->
       doc[comp] ?= {}
       doc[comp] = {} unless typeof doc[comp] is 'object' and not Array.isArray doc[comp]
       for k, v of fields
-        doc[comp][k] = v
+        if String(k).includes '.'
+          setAtPath doc[comp], k, v
+        else
+          doc[comp][k] = v
     else
       doc[comp] = fields
   doc
@@ -76,7 +118,7 @@ export deepFreeze = (o) ->
   deepFreeze v for own k, v of o
   o
 
-# read a dot-path (component.field) off a doc
+# read a dot-path (component.field[.nested...]) off a doc
 export getPath = (doc, dotPath) ->
   cur = doc
   for part in String(dotPath).split '.'

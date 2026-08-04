@@ -70,7 +70,9 @@ function createApp() {
     toolsError: '', toolsEnabledOverridden: false, contextWindow: 32768, tokensUsed: 0,
     speak: false, speakWarning: false,
   },
-  editing: null, // {r, ci, value, x, y, w}
+  editing: null, // {r, ci, value, x, y, w} field overlay edit
+  stageEditing: null, // stage-owned interactive edit: { stage, id, r, ci }
+  _stageMounts: null, // Map cellKey -> { el, slug, unmount?, id }
   renaming: null, // {id, value}
   magicInput: {}, fieldColumnEdit: null, // ci -> draft prompt / {ci, value}
   sort: null, // {ci, dir: 'asc'|'desc'} — user A–Z / Z–A; overrides stage.sort
@@ -871,6 +873,141 @@ function createApp() {
     if (col.field) return this.widget(getPath(row.doc, col.field), `${row.id}|${ci}`)
     return ''
   },
+  stageCellKey(rowId, stage) { return `${rowId}|${stage}` },
+  scheduleStageMounts() {
+    if (this._stageMountRaf) return
+    this._stageMountRaf = requestAnimationFrame(() => {
+      this._stageMountRaf = 0
+      this.syncStageMounts()
+    })
+  },
+  /** After paint: call optional views.mount(el, ctx) on stage cells; unmount stale ones. */
+  syncStageMounts() {
+    if (!this._stageMounts) this._stageMounts = new Map()
+    const seen = new Set()
+    const tds = document.querySelectorAll('td[data-r][data-c] .cell-inner')
+    for (const inner of tds) {
+      const td = inner.closest('td[data-r][data-c]')
+      if (!td) continue
+      const i = Number(td.dataset.r)
+      const ci = Number(td.dataset.c)
+      if (!Number.isFinite(i) || !Number.isFinite(ci)) continue
+      const row = this.rows[i]
+      const col = this.columns[ci]
+      if (!row?.id || !col?.stage) continue
+      const slug = col.stage
+      const mod = this.viewMods[slug]
+      if (!mod?.views?.mount) continue
+      const key = this.stageCellKey(row.id, slug)
+      seen.add(key)
+      const prev = this._stageMounts.get(key)
+      // Remount when DOM node was replaced (x-html rewrite) or entity id changed.
+      if (prev && prev.el === inner && prev.slug === slug && prev.id === row.id) continue
+      if (prev?.unmount) {
+        try { prev.unmount() } catch {}
+      }
+      let unmount = null
+      try {
+        const ctx = this.makeStageViewCtx(row, ci, slug)
+        const ret = mod.views.mount(inner, ctx)
+        if (typeof ret === 'function') unmount = ret
+        else if (ret && typeof ret.unmount === 'function') unmount = () => ret.unmount()
+      } catch (err) {
+        console.warn('views.mount failed', slug, err)
+      }
+      this._stageMounts.set(key, { el: inner, slug, id: row.id, unmount })
+    }
+    for (const [key, prev] of [...this._stageMounts.entries()]) {
+      if (seen.has(key)) continue
+      if (prev?.unmount) {
+        try { prev.unmount() } catch {}
+      }
+      this._stageMounts.delete(key)
+    }
+  },
+  makeStageViewCtx(row, ci, stage) {
+    const app = this
+    const entityId = row.id
+    const local = Math.max(0, app.rows.indexOf(row))
+    const absR = app.winStart + local
+    const liveEntity = () => app.rows.find((r) => r.id === entityId)?.doc ?? row.doc
+    return {
+      get entity() { return liveEntity() },
+      entityId,
+      stage,
+      activity: app.actSlug,
+      columnIndex: ci,
+      rowIndex: absR,
+      canPersist: () => app.canPersist(),
+      patchEntity: (patch) => app.patchEntity(entityId, patch),
+      setStageEditing: (on) => {
+        if (on) app.stageEditing = { stage, id: entityId, r: absR, ci }
+        else if (app.stageEditing?.id === entityId && app.stageEditing?.stage === stage) app.stageEditing = null
+        // Do not full-redraw while focusing an input — just track state.
+      },
+      isStageEditing: () => app.stageEditing?.id === entityId && app.stageEditing?.stage === stage,
+      showToast: (msg) => app.showToast(msg),
+      redraw: () => { M.redraw(); app.scheduleStageMounts() },
+    }
+  },
+  /** Generic entity patch: { component: { fieldOrNestedPath: value } } via PATCH API. */
+  async patchEntity(id, patch) {
+    if (!this.canPersist()) {
+      this.showToast('desynced — cannot persist')
+      return null
+    }
+    if (!id || !patch || typeof patch !== 'object') return null
+    // Expand multi-component patch into sequential field writes (server is one field per call).
+    const ops = []
+    for (const [component, fields] of Object.entries(patch)) {
+      if (fields != null && typeof fields === 'object' && !Array.isArray(fields)) {
+        for (const [field, value] of Object.entries(fields)) ops.push({ component, field, value })
+      } else {
+        ops.push({ component, field: '', value: fields })
+      }
+    }
+    if (!ops.length) return null
+    let doc = null
+    try {
+      for (const op of ops) {
+        const response = await fetch(`/api/entity/${encodeURIComponent(id)}?activity=${this.actSlug}`, {
+          method: 'PATCH', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(op),
+        })
+        const result = await response.json()
+        if (!response.ok || !result.ok) throw new Error(result.error ?? `save failed (${response.status})`)
+        doc = result.doc
+      }
+      if (doc) {
+        this.rows = this.rows.map((row) => row.id === id ? { ...row, doc } : row)
+        M.redraw()
+        this.scheduleStageMounts()
+      }
+      return doc
+    } catch (error) {
+      this.showToast(error.message ?? 'save failed')
+      return null
+    }
+  },
+  /** Dispatch keyboard to the active stage view when it implements views.onKey. */
+  dispatchStageKey(e) {
+    const a = this.sel.active
+    if (!a) return false
+    const col = this.columns[a.c]
+    if (!col?.stage) return false
+    const mod = this.viewMods[col.stage]
+    if (typeof mod?.views?.onKey !== 'function') return false
+    const i = a.r - this.winStart
+    const row = this.rows[i]
+    if (!row) return false
+    const ctx = this.makeStageViewCtx(row, a.c, col.stage)
+    try {
+      return mod.views.onKey(e, ctx) === true
+    } catch (err) {
+      console.warn('views.onKey failed', col.stage, err)
+      return false
+    }
+  },
   jsonBranchKey(cellKey, path) { return `${cellKey}|${path}` },
   jsonValueHtml(v, cellKey, path = '$') {
     if (v === null) return '<span class="json-null">null</span>'
@@ -1179,10 +1316,31 @@ function createApp() {
   isActive(i, ci) { const a = this.sel.active; return a && a.r === this.absRow(i) && a.c === ci },
   globalKey(e) {
     if (this.editing || this.focus) return
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+    // Stage-owned inputs keep focus; Escape still cancels stage edit via onKey when possible.
+    const tag = e.target?.tagName
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable
+    if (inField && !e.target?.closest?.('.stage-view-root')) return
+    if (this.stageEditing || this.dispatchStageKey(e)) {
+      // Stage view handled the key (or is mid-edit). Escape without handler cancels stageEditing.
+      if (e.key === 'Escape' && this.stageEditing && !inField) {
+        e.preventDefault()
+        this.stageEditing = null
+        M.redraw()
+        this.scheduleStageMounts()
+      }
+      return
+    }
+    if (inField) return
     if (e.key === 'Escape') {
       e.preventDefault()
       this.clearSelection()
+      return
+    }
+    // Shift+F5 → same as the Play toolbar button (run selection).
+    // preventDefault so the browser does not hard-refresh (common Shift+F5 binding).
+    if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'F5' || e.code === 'F5')) {
+      e.preventDefault()
+      void this.play()
       return
     }
     const a = this.sel.active
@@ -1207,7 +1365,13 @@ function createApp() {
       this.copySelection()
       return
     }
-    if (e.key === 'Delete') {
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      // Stage columns: never blank via generic path unless the view handled it above.
+      const col = a ? this.columns[a.c] : null
+      if (col?.stage) {
+        e.preventDefault()
+        return
+      }
       e.preventDefault()
       this.blankSelection()
       return
@@ -1261,6 +1425,15 @@ function createApp() {
       if (e.ctrlKey || e.metaKey) { dr *= this.total; dc *= this.columns.length } // jump to edge
       const r = moveSelTo(a.r + dr, a.c + dc, { shift: e.shiftKey })
       this.scrollToRow(r)
+      return
+    }
+    // Field columns use the overlay editor; stage columns only edit if the view handles keys.
+    const activeCol = this.columns[a.c]
+    if (activeCol?.stage) {
+      if (e.key === 'Enter' || (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1)) {
+        e.preventDefault()
+        // onKey already had a chance above; no generic stage overlay.
+      }
       return
     }
     if (e.key === 'Enter') { e.preventDefault(); this.startEditActive() }
@@ -1461,6 +1634,20 @@ function createApp() {
   startEditActive(replaceWith = null) {
     const a = this.sel.active; if (!a) return
     const col = this.columns[a.c]
+    // Stage cells: ask the view to begin an in-cell edit (no field overlay).
+    if (col?.stage) {
+      const i = a.r - this.winStart
+      const row = this.rows[i]; if (!row) return
+      const mod = this.viewMods[col.stage]
+      if (typeof mod?.views?.beginEdit === 'function') {
+        try {
+          mod.views.beginEdit(this.makeStageViewCtx(row, a.c, col.stage), replaceWith)
+        } catch (err) {
+          console.warn('views.beginEdit failed', col.stage, err)
+        }
+      }
+      return
+    }
     if (!col?.field) return
     const i = a.r - this.winStart
     const row = this.rows[i]; if (!row) return
@@ -1492,12 +1679,22 @@ function createApp() {
       if (!response.ok || !result.ok) throw new Error(result.error ?? `save failed (${response.status})`)
       this.rows = this.rows.map((row) => row.id === ed.id ? { ...row, doc: result.doc } : row)
       M.redraw()
+      this.scheduleStageMounts()
       this.showToast(`saved ${ed.id}.yaml`)
     } catch (error) {
       this.showToast(error.message ?? 'save failed')
     }
   },
-  cellDbl(i, ci) { this.sel.active = { r: this.absRow(i), c: ci }; this.startEditActive() },
+  cellDbl(i, ci) {
+    this.sel.active = { r: this.absRow(i), c: ci }
+    const col = this.columns[ci]
+    if (col?.stage) {
+      // Prefer view-owned beginEdit; otherwise no-op (stage cells are not field overlays).
+      this.startEditActive()
+      return
+    }
+    this.startEditActive()
+  },
 
   // ---- magic row (Β) ----
   magicTitle(ci) {
@@ -2183,7 +2380,10 @@ function createApp() {
     this.redrawGrid()
     return true
   },
-  redrawGrid() { M.redraw() },
+  redrawGrid() {
+    M.redraw()
+    this.scheduleStageMounts()
+  },
   componentChecked(group) { return group.fields.length > 0 && group.fields.every((field) => this.hasFieldColumn(field.path)) },
   async toggleComponent(group) {
     if (!this.canPersist()) return
@@ -2402,12 +2602,10 @@ function createApp() {
       const row = rows.get(rowIndex)
       const column = this.columns[columnIndex]
       if (!row || !column) continue
+      // Stage columns never participate in generic blank — views handle Delete themselves.
+      if (column.stage) continue
       let fields = []
       if (column.field) fields = [column.field]
-      else if (column.stage) {
-        const meta = await this.stageMeta(column.stage)
-        fields = meta?.writes ?? []
-      }
       if (!fields.length) continue
       if (!byId.has(row.id)) byId.set(row.id, new Set())
       fields.forEach((field) => byId.get(row.id).add(field))
@@ -3192,7 +3390,7 @@ function createApp() {
         </div>
         <div class="toolbar-end">
           <span class="play-summary" x-text="playSummaryLabel"></span>
-          <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection">
+          <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection (Shift+F5)">
             <i class="ph-bold ph-play" aria-hidden="true"></i>
           </button>
         </div>

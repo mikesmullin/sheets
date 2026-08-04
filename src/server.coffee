@@ -603,7 +603,7 @@ export startServer = (opts = {}) ->
         created.push { id: nextId, from: id, file: target }
       return json { ok: true, created }
 
-    # DELETE-key clear: drop keys from entity YAML (not null). Empty components removed.
+    # DELETE-key clear: drop keys from entity YAML (not null). Nested paths + empty parents pruned.
     if p is '/api/entities/blank' and req.method is 'POST'
       body = await req.json()
       a = resolveActivity body.activity
@@ -616,17 +616,10 @@ export startServer = (opts = {}) ->
         { doc, body: mdBody } = E.readEntityFile file
         changed = false
         for dotPath in (item.fields ? [])
-          [component, ...rest] = String(dotPath).split '.'
-          field = rest.join '.'
-          continue unless component and field
-          continue unless doc?[component]? and typeof doc[component] is 'object' and not Array.isArray(doc[component])
-          continue unless Object.prototype.hasOwnProperty.call doc[component], field
-          delete doc[component][field]
-          changed = true
-          blanked++
-          # Drop empty component objects so YAML stays tidy.
-          if Object.keys(doc[component]).length is 0
-            delete doc[component]
+          continue unless String(dotPath ? '').includes '.'
+          if E.deleteAtPath doc, dotPath
+            changed = true
+            blanked++
         continue unless changed
         E.writeEntityFile file, doc, mdBody
         await store.upsert a.source, item.id, doc, fs.statSync(file).mtimeMs
@@ -644,9 +637,13 @@ export startServer = (opts = {}) ->
         file = E.fileFor a.source, id
         return json { error: 'not found' }, 404 unless file
         { doc, body: mdBody } = E.readEntityFile file
+        component = String(body.component ? '').trim()
+        field = String(body.field ? '')
+        return json { error: 'component required' }, 400 unless component
         patch = {}
-        patch[body.component] = {}
-        patch[body.component][body.field] = body.value
+        patch[component] = {}
+        # body.field may be nested under the component (e.g. destination.permanent_space).
+        if field then patch[component][field] = body.value else patch[component] = body.value
         E.mergePatch doc, patch
         E.writeEntityFile file, doc, mdBody
         await store.upsert a.source, id, doc, fs.statSync(file).mtimeMs
