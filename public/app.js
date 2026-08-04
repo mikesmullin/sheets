@@ -29,6 +29,10 @@ const hashColor = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h 
 const getPath = (doc, p) => { let c = doc; for (const k of String(p).split('.')) { if (c == null || typeof c !== 'object') return undefined; c = c[k] } return c }
 const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'stage'
 const copyColumns = (columns) => columns.map((column) => ({ ...column }))
+// Column filters are a per-user view preference, not sheet structure — they live in
+// localStorage so they never dirty the activity YAML or bump its revision.
+const COL_FILTER_KEY = 'sheets-col-filters'
+const escapeRe = (s) => String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const normalizeColWidth = (width) => {
   const n = Math.round(Number(width))
   if (!Number.isFinite(n)) return DEFAULT_COL_WIDTH
@@ -71,6 +75,9 @@ function createApp() {
   magicInput: {}, fieldColumnEdit: null, // ci -> draft prompt / {ci, value}
   sort: null, // {ci, dir: 'asc'|'desc'} — user A–Z / Z–A; overrides stage.sort
   colFilters: {}, // ci -> regex string (applied server-side on column values)
+  colFilterNot: {}, // ci -> true when the column filter is inverted (NOT)
+  colFilterPicks: {}, // ci -> [exact cell texts] chosen from the top-values checkboxes
+  filterValues: { ci: null, loading: false, items: [], sampled: 0, distinct: 0 },
   filterMenu: null, // { ci } when open
   filterDraft: '', // live input in open filter menu
   _filterDebounce: null,
@@ -208,9 +215,11 @@ function createApp() {
       if (!exists) {
         history.replaceState(null, '', `${location.pathname}${location.search}`)
         this.actSlug = this.meta?.activities?.[0]?.slug ?? null
+        this.restoreColFilters()
         this.refreshWindow(true)
       } else if (a[1] !== this.actSlug) {
         this.actSlug = a[1]
+        this.restoreColFilters()
         this.refreshWindow(true)
       }
     }
@@ -222,6 +231,7 @@ function createApp() {
     if (this.chat.enabled) await this.loadChatConfig()
     if (!this.actSlug) this.actSlug = this.meta.activities[0]?.slug ?? null
     this._colValuePath = {}
+    this.restoreColFilters()
     await this.refreshWindow(resetWindow)
     const [fieldData, stageData] = await Promise.all([
       fetch(`/api/fields?activity=${this.actSlug}`).then((response) => response.json()),
@@ -438,14 +448,31 @@ function createApp() {
       }
     }
     // Per-column regex filters (AND). Empty / invalid patterns are skipped client-side.
-    for (const [ciKey, pattern] of Object.entries(this.colFilters ?? {})) {
-      const text = String(pattern ?? '')
-      if (!text) continue
-      try { new RegExp(text) } catch { continue }
-      const path = await this.valuePathForColumn(Number(ciKey))
-      if (!path) continue
-      params.append('filterPath', path)
-      params.append('filterRe', text)
+    // A column can contribute two entries: the typed regex and the checked top values.
+    const ciKeys = new Set([
+      ...Object.keys(this.colFilters ?? {}),
+      ...Object.keys(this.colFilterPicks ?? {}),
+    ])
+    for (const ciKey of ciKeys) {
+      const ci = Number(ciKey)
+      // Stage columns filter on views.text (what is rendered); field columns on the path.
+      const stage = this.columns?.[ci]?.stage ?? ''
+      const path = await this.valuePathForColumn(ci)
+      if (!path && !stage) continue
+      const not = this.colFilterNot?.[ci] ? '1' : '0'
+      const push = (re) => {
+        params.append('filterPath', path ?? '')
+        params.append('filterRe', re)
+        params.append('filterStage', stage)
+        params.append('filterNot', not)
+      }
+      const text = String(this.colFilters?.[ci] ?? '')
+      if (text) {
+        try { new RegExp(text); push(text) } catch { /* invalid pattern */ }
+      }
+      const picks = this.colFilterPicks?.[ci] ?? []
+      // Checked values are exact cell texts, so anchor them rather than substring-match.
+      if (picks.length) push(`^(?:${picks.map(escapeRe).join('|')})$`)
     }
     return params
   },
@@ -458,6 +485,8 @@ function createApp() {
       q: this.search ?? '',
       sort: this.sort ?? null,
       f: this.colFilters ?? {},
+      n: this.colFilterNot ?? {},
+      p: this.colFilterPicks ?? {},
     })
   },
   _invalidateWindowState() {
@@ -936,6 +965,17 @@ function createApp() {
     this.sel.active = { r, c: ci }
   },
   cellUp() { this._dragSel = false },
+  clearSelection() {
+    if (!this.sel.ranges.length && !this.sel.active) return
+    this.sel = { ranges: [], active: null, anchor: null }
+    M.redraw()
+  },
+  // Mousedown on the empty area beside/below the grid deselects, like Escape.
+  // Anything that owns its own click (cells, headers, menus, resize grips) opts out.
+  gridVoidDown(e) {
+    if (e.target.closest('td, th, .col-filter-menu, .col-resize, .row-resize')) return
+    this.clearSelection()
+  },
   colHeadClick(ci, e) {
     if (this.colResize?.moved || this._suppressColClick) return
     if (e.altKey) return this.toggleSort(ci)
@@ -1140,6 +1180,11 @@ function createApp() {
   globalKey(e) {
     if (this.editing || this.focus) return
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      this.clearSelection()
+      return
+    }
     const a = this.sel.active
     const lastR = Math.max(0, (this.total || 1) - 1)
     const lastC = Math.max(0, this.columns.length - 1)
@@ -1666,7 +1711,134 @@ function createApp() {
     M.redraw()
   },
   columnHasFilter(ci) {
-    return !!(this.colFilters?.[ci] && String(this.colFilters[ci]).length)
+    return !!String(this.colFilters?.[ci] ?? '').length || !!this.colFilterPicks?.[ci]?.length
+  },
+  // Filters are stored by column identity (stage slug / field path), not index, so
+  // reordering or hiding columns cannot land a saved filter on a different column.
+  _colKey(ci) {
+    const col = this.columns?.[ci]
+    if (!col) return null
+    if (col.stage) return `stage:${col.stage}`
+    if (col.field) return `field:${col.field}`
+    return null
+  },
+  _readColFilterStore() {
+    try { return JSON.parse(localStorage.getItem(COL_FILTER_KEY) || '{}') ?? {} }
+    catch { return {} }
+  },
+  saveColFilters() {
+    const slug = this.actSlug
+    // Never write from a half-booted state — an empty columns list would persist
+    // "no filters" and wipe the operator's saved view.
+    if (!slug || !this.columns.length) return
+    const entry = {}
+    for (const [ciKey, pattern] of Object.entries(this.colFilters ?? {})) {
+      const ci = Number(ciKey)
+      const key = this._colKey(ci)
+      const re = String(pattern ?? '')
+      if (!key || !re) continue
+      entry[key] = { re, not: !!this.colFilterNot?.[ci], picks: this.colFilterPicks?.[ci] ?? [] }
+    }
+    for (const [ciKey, picks] of Object.entries(this.colFilterPicks ?? {})) {
+      const ci = Number(ciKey)
+      const key = this._colKey(ci)
+      if (!key || !picks?.length || entry[key]) continue
+      entry[key] = { re: '', not: !!this.colFilterNot?.[ci], picks }
+    }
+    try {
+      const all = this._readColFilterStore()
+      if (Object.keys(entry).length) all[slug] = entry
+      else delete all[slug]
+      localStorage.setItem(COL_FILTER_KEY, JSON.stringify(all))
+    } catch { /* storage unavailable */ }
+  },
+  restoreColFilters() {
+    // Columns arrive with meta; before that there is nothing to key filters to.
+    if (!this.columns.length) return
+    const entry = this._readColFilterStore()[this.actSlug] ?? {}
+    const filters = {}
+    const nots = {}
+    const picks = {}
+    this.columns.forEach((col, ci) => {
+      const key = this._colKey(ci)
+      const saved = key ? entry[key] : null
+      if (!saved) return
+      const savedPicks = Array.isArray(saved.picks) ? saved.picks.map(String) : []
+      if (savedPicks.length) picks[ci] = savedPicks
+      const re = String(saved.re ?? '')
+      if (re) {
+        // A pattern that no longer compiles would hide every row — drop it silently.
+        try { new RegExp(re); filters[ci] = re } catch { /* stale pattern */ }
+      }
+      if (saved.not && (filters[ci] || savedPicks.length)) nots[ci] = true
+    })
+    this.colFilters = filters
+    this.colFilterNot = nots
+    this.colFilterPicks = picks
+  },
+  // ---- top values (facet checkboxes) ----
+  async loadColumnValues(ci) {
+    const col = this.columns?.[ci]
+    if (!col) return
+    this.filterValues = { ci, loading: true, items: [], sampled: 0, distinct: 0 }
+    M.redraw()
+    const path = await this.valuePathForColumn(ci)
+    const params = new URLSearchParams({
+      activity: this.actSlug ?? '',
+      stage: col.stage ?? '',
+      path: path ?? '',
+      limit: '12',
+    })
+    try {
+      const data = await (await fetch(`/api/column/values?${params}`)).json()
+      if (this.filterMenu?.ci !== ci) return // menu moved on while we were fetching
+      this.filterValues = {
+        ci,
+        loading: false,
+        items: data.values ?? [],
+        sampled: data.sampled ?? 0,
+        distinct: data.distinct ?? 0,
+      }
+    } catch {
+      this.filterValues = { ci, loading: false, items: [], sampled: 0, distinct: 0 }
+    }
+    M.redraw()
+  },
+  valuePct(item) {
+    const sampled = this.filterValues?.sampled ?? 0
+    if (!sampled) return 0
+    return Math.round((Number(item?.count ?? 0) / sampled) * 1000) / 10
+  },
+  get filterValuesOtherPct() {
+    const shown = (this.filterValues?.items ?? []).reduce((sum, item) => sum + Number(item.count ?? 0), 0)
+    const sampled = this.filterValues?.sampled ?? 0
+    if (!sampled) return 0
+    return Math.round(((sampled - shown) / sampled) * 1000) / 10
+  },
+  isValuePicked(ci, value) {
+    return (this.colFilterPicks?.[ci] ?? []).includes(value)
+  },
+  toggleValuePick(ci, value) {
+    const current = this.colFilterPicks?.[ci] ?? []
+    const next = current.includes(value) ? current.filter((v) => v !== value) : [...current, value]
+    const map = { ...(this.colFilterPicks ?? {}) }
+    if (next.length) map[ci] = next
+    else delete map[ci]
+    this.colFilterPicks = map
+    this.saveColFilters()
+    this.refreshWindow(this.filterMenu?.ci === ci ? false : true)
+    M.redraw()
+  },
+  // NOT inverts the column predicate server-side. Toggling only costs a refetch
+  // when a pattern is actually applied — inverting an empty filter is a no-op.
+  toggleFilterNot(ci) {
+    const next = { ...(this.colFilterNot ?? {}) }
+    if (next[ci]) delete next[ci]
+    else next[ci] = true
+    this.colFilterNot = next
+    this.saveColFilters()
+    if (this.columnHasFilter(ci)) this.refreshWindow(this.filterMenu?.ci === ci ? false : true)
+    M.redraw()
   },
   openFilterMenu(ci, e) {
     e?.stopPropagation?.()
@@ -1685,6 +1857,7 @@ function createApp() {
     }
     this.filterMenu = { ci }
     this.filterDraft = this.colFilters?.[ci] ?? ''
+    this.loadColumnValues(ci)
     this._bindFilterMenuOutside()
     M.redraw()
     setTimeout(() => document.querySelector('.col-filter-menu input.filter-re')?.focus(), 0)
@@ -1758,6 +1931,7 @@ function createApp() {
       const selStart = keepFocus ? active.selectionStart : null
       const selEnd = keepFocus ? active.selectionEnd : null
       this.colFilters = next
+      this.saveColFilters()
       // Keep grid scroll when filtering from the open menu.
       await this.refreshWindow(this.filterMenu?.ci === ci ? false : true)
       M.redraw()
@@ -1797,7 +1971,7 @@ function createApp() {
       this._filterDebounce = null
     }
     this.filterDraft = ''
-    if (!this.colFilters?.[ci]) {
+    if (!this.columnHasFilter(ci)) {
       this.filterMenu = null
       M.redraw()
       return
@@ -1805,6 +1979,13 @@ function createApp() {
     const next = { ...this.colFilters }
     delete next[ci]
     this.colFilters = next
+    const nextNot = { ...(this.colFilterNot ?? {}) }
+    delete nextNot[ci]
+    this.colFilterNot = nextNot
+    const nextPicks = { ...(this.colFilterPicks ?? {}) }
+    delete nextPicks[ci]
+    this.colFilterPicks = nextPicks
+    this.saveColFilters()
     this.filterMenu = null
     this.refreshWindow(true)
     M.redraw()
@@ -2103,6 +2284,9 @@ function createApp() {
     this.filterMenu = null
     this.sort = null
     this.colFilters = {}
+    this.colFilterNot = {}
+    this.colFilterPicks = {}
+    this.saveColFilters()
     this._colValuePath = {}
     M.redraw()
     this.showToast(`saved ${field}`)
@@ -2113,6 +2297,8 @@ function createApp() {
     if (slug === this.actSlug) return this.startTabRename(slug)
     this.actSlug = slug
     this.tabMenu = null
+    this.filterMenu = null
+    this.restoreColFilters()
     location.hash = `#/a/${slug}`
     await this.refreshWindow(true)
   },
@@ -3040,7 +3226,7 @@ function createApp() {
         </div>
       </div>
 
-      <div class="gridwrap" x-show="!focus" @scroll="onScroll($event)" @mouseup="cellUp()">
+      <div class="gridwrap" x-show="!focus" @scroll="onScroll($event)" @mouseup="cellUp()" @mousedown="gridVoidDown($event)">
         <table class="grid" :class="(colResize ? 'col-resizing ' : '') + (rowResize ? 'row-resizing' : '')">
           <thead>
             <tr>
@@ -3104,7 +3290,13 @@ function createApp() {
                       </button>
                       <button type="button" class="cfm-clear" x-show="sort && sort.ci === ci" @click.stop="clearSort(ci)" title="clear sort">×</button>
                     </div>
-                    <div class="cfm-label"><i class="ph-bold ph-funnel" aria-hidden="true"></i>Filter by value:</div>
+                    <div class="cfm-label cfm-filter-label">
+                      <i class="ph-bold ph-funnel" aria-hidden="true"></i><span>Filter by value:</span>
+                      <button type="button" class="cfm-not" :class="colFilterNot && colFilterNot[ci] ? 'on' : ''"
+                        :aria-pressed="colFilterNot && colFilterNot[ci] ? 'true' : 'false'"
+                        @click.stop="toggleFilterNot(ci)"
+                        :title="colFilterNot && colFilterNot[ci] ? 'inverted — showing rows that do NOT match' : 'invert filter — show rows that do NOT match'">NOT</button>
+                    </div>
                     <div class="cfm-filter-row" :class="filterDraft ? 'has-clear' : ''">
                       <input class="filter-re" type="text" placeholder="regex…" spellcheck="false"
                         :id="'sheets-col-filter-' + ci"
@@ -3116,6 +3308,33 @@ function createApp() {
                         @click.stop="clearFilterInput(ci)" title="clear filter">
                         <i class="ph-bold ph-x" aria-hidden="true"></i>
                       </button>
+                    </div>
+                    <div class="cfm-values" x-show="filterMenu && filterMenu.ci === ci">
+                      <div class="cfm-label"><i class="ph-bold ph-list-numbers" aria-hidden="true"></i>Top values</div>
+                      <div class="cfm-values-empty" x-show="filterValues.loading">counting…</div>
+                      <div class="cfm-values-empty" x-show="!filterValues.loading && !filterValues.items.length">no values</div>
+                      <label class="cfm-value" x-for="v, vi in filterValues.items" :key="v.value" @click.stop>
+                        <input type="checkbox" :checked="isValuePicked(ci, v.value)"
+                          @change.stop="toggleValuePick(ci, v.value)">
+                        <span class="cfm-value-main">
+                          <span class="cfm-value-row">
+                            <span class="cfm-value-text" :title="v.value" x-text="v.value"></span>
+                            <span class="cfm-value-pct" x-text="valuePct(v) + '%'"></span>
+                          </span>
+                          <span class="cfm-value-bar"><span :style="'width:' + valuePct(v) + '%'"></span></span>
+                        </span>
+                      </label>
+                      <div class="cfm-value other" x-show="!filterValues.loading && filterValues.items.length">
+                        <span class="cfm-value-main">
+                          <span class="cfm-value-row">
+                            <span class="cfm-value-text">Other</span>
+                            <span class="cfm-value-pct" x-text="filterValuesOtherPct + '%'"></span>
+                          </span>
+                          <span class="cfm-value-bar"><span :style="'width:' + filterValuesOtherPct + '%'"></span></span>
+                        </span>
+                      </div>
+                      <div class="cfm-values-note" x-show="!filterValues.loading && filterValues.items.length"
+                        x-text="filterValues.distinct + ' distinct across ' + filterValues.sampled + ' rows'"></div>
                     </div>
                   </div>
                 </div>

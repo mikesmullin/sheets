@@ -291,11 +291,29 @@ export startServer = (opts = {}) ->
         rows = rows.filter (row) -> entityMatchesSearch row, re
     filters = opts.filters ? []
     if filters.length
+      # Stage columns filter on views.text — the plain-text form of what the operator
+      # actually sees — so a derived state like "BLOCKED" matches even when it is not
+      # a stored field. Modules are loaded once per query, not per row.
+      textFns = {}
+      for f in filters when f.stage
+        unless textFns[f.stage]?
+          mod = try await stages.load f.stage catch then null
+          textFns[f.stage] = mod?.views?.text ? null
       rows = rows.filter (row) ->
         filters.every (f) ->
           re = compileFilter f.re
           return true unless re?
-          re.test cellText row.doc, f.path
+          fn = if f.stage then textFns[f.stage] else null
+          # Nothing to test against — pass, and do not let NOT invert that into
+          # a filter that hides every row.
+          return true unless fn? or f.path
+          hit =
+            if fn?
+              value = try fn row.doc catch then ''
+              re.test String(value ? '')
+            else
+              re.test cellText row.doc, f.path
+          if f.not then not hit else hit
     sortPath = opts.sortPath or opts.sortField or null
     dir = opts.dir ? 'asc'
     if sortPath
@@ -400,9 +418,14 @@ export startServer = (opts = {}) ->
       q = url.searchParams.get('q') or null
       filterPaths = url.searchParams.getAll 'filterPath'
       filterRes = url.searchParams.getAll 'filterRe'
+      filterStages = url.searchParams.getAll 'filterStage'
+      filterNots = url.searchParams.getAll 'filterNot'
       filters = []
-      for fpath, i in filterPaths when fpath
-        filters.push { path: fpath, re: filterRes[i] ? '' }
+      for re, i in filterRes
+        fpath = filterPaths[i] ? ''
+        fstage = filterStages[i] ? ''
+        continue unless fpath or fstage
+        filters.push { path: fpath, re: re ? '', stage: fstage, not: String(filterNots[i] ? '') is '1' }
       # Always go through queryEntities when sorting, filtering, or searching so
       # user A–Z / regex prefs apply uniformly (stage.sort is default-only).
       if sortPath or sortField or sortStage or filters.length or q or dir is 'desc'
@@ -696,6 +719,40 @@ export startServer = (opts = {}) ->
         doc.revision = Number(doc.revision ? 0) + 1
       persisted 'activity', { slug: a.slug }
       return json { ok: true, slug, authored: false }
+
+    # Facet counts for one column, computed from the same text a filter matches
+    # against (stage views.text, else the field value) so the checkbox list and the
+    # regex box can never disagree about what a cell "says".
+    if p is '/api/column/values' and req.method is 'GET'
+      a = resolveActivity url.searchParams.get('activity')
+      stageSlug = url.searchParams.get('stage') or ''
+      fpath = url.searchParams.get('path') or ''
+      limit = Math.max 1, Math.min 50, Number(url.searchParams.get('limit') ? 12)
+      textFn = null
+      if stageSlug
+        mod = try await stages.load stageSlug catch then null
+        textFn = mod?.views?.text ? null
+      return json { values: [], sampled: 0, distinct: 0, total: 0 } unless textFn? or fpath
+      rows = await store.allRows a.source
+      counts = new Map()
+      sampled = 0
+      for row in rows
+        value = if textFn?
+          try String(textFn(row.doc) ? '') catch then ''
+        else
+          cellText row.doc, fpath
+        value = String(value ? '').trim()
+        continue unless value
+        sampled += 1
+        counts.set value, (counts.get(value) ? 0) + 1
+      values = Array.from counts, ([value, count]) -> { value, count }
+      values.sort (x, y) -> (y.count - x.count) or x.value.localeCompare y.value
+      return json {
+        total: rows.length
+        sampled
+        distinct: values.length
+        values: values.slice 0, limit
+      }
 
     # Stage modules are served at real URLs that mirror the on-disk layout, so the
     # browser's module loader resolves `../lib/*.mjs` natively (no blob/data URLs).

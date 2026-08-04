@@ -336,6 +336,12 @@ table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 .col-filter-menu .cfm-label { display: inline-flex; align-items: center; gap: 6px; color: var(--dim);
   font-size: 11px; font-weight: 600; letter-spacing: .02em; text-align: left; align-self: flex-start; }
 .col-filter-menu > .cfm-label { width: 100%; }
+.col-filter-menu .cfm-filter-label { display: flex; align-items: center; gap: 6px; }
+.col-filter-menu .cfm-filter-label > span { flex: 0 1 auto; }
+.col-filter-menu .cfm-not { margin-left: auto; height: 20px; padding: 0 7px; flex: 0 0 auto;
+  font: 600 10px/1 ui-monospace, monospace; letter-spacing: .06em; color: var(--dim); }
+.col-filter-menu .cfm-not.on { color: #ffc4a3; border-color: rgba(255, 150, 100, .55);
+  background: rgba(224, 120, 60, .18); }
 .col-filter-menu .cfm-label i { font-size: 12px; line-height: 1; opacity: .9; flex: 0 0 auto; }
 .col-filter-menu .sort-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .col-filter-menu .cfm-sort { width: 28px; min-width: 28px; height: 24px; padding: 0;
@@ -349,6 +355,20 @@ table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
   padding: 4px 6px; outline: none; box-shadow: none; }
 .col-filter-menu input.filter-re:focus { outline: none; box-shadow: none; }
 .col-filter-menu .cfm-filter-row.has-clear input.filter-re { padding-right: 26px; }
+.col-filter-menu .cfm-values { width: 100%; margin-top: 8px; display: flex; flex-direction: column; gap: 5px;
+  max-height: 260px; overflow-y: auto; }
+.col-filter-menu .cfm-values-empty, .col-filter-menu .cfm-values-note { color: var(--dim); font-size: 10px; }
+.col-filter-menu .cfm-values-note { padding-top: 2px; }
+.col-filter-menu .cfm-value { display: flex; align-items: flex-start; gap: 6px; cursor: pointer; }
+.col-filter-menu .cfm-value.other { cursor: default; padding-left: 19px; opacity: .7; }
+.col-filter-menu .cfm-value input { margin: 2px 0 0; flex: 0 0 auto; }
+.col-filter-menu .cfm-value-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.col-filter-menu .cfm-value-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.col-filter-menu .cfm-value-text { flex: 1 1 auto; min-width: 0; font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-filter-menu .cfm-value-pct { flex: 0 0 auto; font-size: 10px; color: #9ecbff; font-variant-numeric: tabular-nums; }
+.col-filter-menu .cfm-value-bar { height: 3px; border-radius: 2px; background: rgba(255, 255, 255, .12); overflow: hidden; }
+.col-filter-menu .cfm-value-bar > span { display: block; height: 100%; background: rgba(77, 157, 224, .85); }
 
 .grid thead th.col-filtered { box-shadow: inset 0 -2px 0 rgba(77, 157, 224, .55); }
 .spin { display: inline-block; animation: spin 1s linear infinite; }
