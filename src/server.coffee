@@ -610,7 +610,7 @@ export startServer = (opts = {}) ->
         created.push { id: nextId, from: id, file: target }
       return json { ok: true, created }
 
-    # DELETE-key clear: drop keys from entity YAML (not null). Nested paths + empty parents pruned.
+    # DELETE-key clear: stage-aware. Field cells: deleteAtPath. Stage cells: call stage `clear` if exported, else delete writes[0].
     if p is '/api/entities/blank' and req.method is 'POST'
       body = await req.json()
       a = resolveActivity body.activity
@@ -622,6 +622,33 @@ export startServer = (opts = {}) ->
         continue unless file
         { doc, body: mdBody } = E.readEntityFile file
         changed = false
+        if item.stage
+          try
+            mod = await stages.load item.stage
+            handler = mod?.clear ? mod?.onDelete ? null
+            # also support bracket access for `delete` keyword via JS
+            unless handler
+              try handler = mod?['delete'] catch then handler = null
+            if typeof handler is 'function'
+              patch = await handler structuredClone(doc)
+              if patch? and typeof patch is 'object' and not Array.isArray(patch) and Object.keys(patch).length
+                E.mergePatch doc, patch
+                changed = true
+                blanked++
+            else
+              dotPath = mod?.meta?.writes?[0]
+              if dotPath and String(dotPath).includes '.'
+                if E.deleteAtPath doc, dotPath
+                  changed = true
+                  blanked++
+          catch err
+            try
+              mod2 = try await stages.load item.stage catch then null
+              dotPath2 = mod2?.meta?.writes?[0]
+              if dotPath2 and E.deleteAtPath doc, dotPath2
+                changed = true
+                blanked++
+            catch then null
         for dotPath in (item.fields ? [])
           continue unless String(dotPath ? '').includes '.'
           if E.deleteAtPath doc, dotPath

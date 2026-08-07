@@ -1652,12 +1652,6 @@ function createApp() {
       return
     }
     if (e.key === 'Delete' || e.key === 'Backspace') {
-      // Stage columns: never blank via generic path unless the view handled it above.
-      const col = a ? this.columns[a.c] : null
-      if (col?.stage) {
-        e.preventDefault()
-        return
-      }
       e.preventDefault()
       this.blankSelection()
       return
@@ -2806,16 +2800,26 @@ function createApp() {
       const row = rows.get(rowIndex)
       const column = this.columns[columnIndex]
       if (!row || !column) continue
-      // Stage columns never participate in generic blank — views handle Delete themselves.
-      if (column.stage) continue
+      if (column.stage) {
+        if (!byId.has(row.id)) byId.set(row.id, { fields: new Set(), stages: new Set() })
+        byId.get(row.id).stages.add(column.stage)
+        continue
+      }
       let fields = []
       if (column.field) fields = [column.field]
       if (!fields.length) continue
-      if (!byId.has(row.id)) byId.set(row.id, new Set())
-      fields.forEach((field) => byId.get(row.id).add(field))
+      if (!byId.has(row.id)) byId.set(row.id, { fields: new Set(), stages: new Set() })
+      fields.forEach((field) => byId.get(row.id).fields.add(field))
     }
     if (!byId.size) return
-    const items = [...byId].map(([id, fields]) => ({ id, fields: [...fields] }))
+    const items = [...byId].map(([id, entry]) => {
+      const o = { id }
+      if (entry.fields?.size) o.fields = [...entry.fields]
+      if (entry.stages?.size) o.stage = [...entry.stages][0]
+      // multi-stage selection: one item per stage per entity
+      if (entry.stages?.size > 1) return [...entry.stages].map((s) => ({ id, stage: s, fields: o.fields ? [...o.fields] : undefined }))
+      return o
+    }).flat()
     const response = await fetch('/api/entities/blank', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ activity: this.actSlug, items }) })
     const result = await response.json()
     if (!response.ok || !result.ok) return this.showToast(result.error ?? 'could not blank cells')
