@@ -113,10 +113,6 @@ function connect() {
       try {
         if (/\.css$/i.test(file)) {
           reloadCss(file.startsWith('/') ? file : '/' + file);
-        } else if (/(^|\/)m\.js$/i.test(file)) {
-          // app holds a live binding to the first m.js evaluation; bounce fully
-          location.reload();
-          return;
         } else if (/\.(js|mjs|ts)$/i.test(file)) {
           await reloadJs(file);
         } else if (/\.html$/i.test(file)) {

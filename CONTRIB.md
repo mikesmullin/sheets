@@ -13,17 +13,40 @@ those repos updates sheets (and every other linked consumer) immediately.
 ### Local m-js runtime
 
 The SPA imports `public/m.js`, a hard-linked, non-minified copy of the local build at
-`/workspace/m-js/dist/m.js`; it does not load m-js from the cloud CDN. Git commits this as a
-normal file. To change the framework, edit `/workspace/m-js/src/`, then rebuild and refresh the
-hard link:
+`/workspace/mstack/m-js/dist/m.js` (m.js **v3.2+**, keyed VDOM). It does not load m-js from the
+cloud CDN in day-to-day work (the published CDN is the same build:
+`https://mikesmullin.github.io/m-js/dist/m.min.js`). Git commits `public/m.js` as a normal file.
+
+To change the framework, edit `/workspace/mstack/m-js/src/`, then rebuild and refresh the hard link:
 
 ```sh
-cd /workspace/m-js
+cd /workspace/mstack/m-js
 bun build.mjs package
-ln -f dist/m.js /workspace/sheets/public/m.js
+ln -f dist/m.js /workspace/mstack/sheets/public/m.js
 ```
 
 `build.mjs` recreates `dist/`, so the final `ln` command is required after each rebuild.
+
+**Rendering contract (do not regress):**
+
+- Reactive field writes schedule one coalesced `deferredBatchRedraw` per frame. Prefer mutating
+  state over calling `M.redraw()`.
+- Explicit `M.redraw()` is for out-of-band invalidation (HMR method/template patch, swapped stage
+  view modules) — not after every assignment.
+- Do not reintroduce the v3.0 destroy/rebuild workarounds (scroll snapshot around every redraw,
+  500 ms force throttle, full-grid redraws for the chat stopwatch). VDOM reuses nodes; a redraw
+  with unchanged state performs zero DOM writes.
+- Imperative `views.mount` widgets still need `scheduleStageMounts()` after paint; that is the
+  only post-redraw mount pass the grid should keep.
+- **Never put rAF handles, load caches, or scroll bookkeeping on `this`.** The mount root is a
+  reactive proxy: `this._stageMountRaf = id` schedules another redraw and used to create a
+  permanent idle loop. Ephemeral state lives in the module-level `rt` bag in `public/app.js`.
+  Stage view modules also live in `rt.viewMods` so `cellHtml` / `ensureView` can run during
+  render without writing reactive state.
+- **m-js handler rebind:** when a live `@click` is kept across redraws, the vnode must retain the
+  *live* function identity (`newVNode.attrs[k] = ov` after rebind). Without that, x-for row/column
+  clicks keep a stale `$index` after sort/reorder. Fixed in m-js ≥ the build linked into
+  `public/m.js`; covered by `tests/x-for.test.js` (“row click sees current index after reverse”).
 
 ## Concepts
 
@@ -77,6 +100,18 @@ YAML on disk is authoritative; the server mirrors every activity source into emb
 
 `bun test test/` — engine invariants (entity lock, gate→idle FSM, merge/null semantics,
 dedupe, run logs) + the 500-fruit benchmark over the HTTP API with a deterministic stub stage.
+
+If a `sheets serve` is already running on `examples/fruit`, integration may fail because
+`fs.cpSync` copies `db/.lock` into the temp workspace. Stop the fruit server (or delete the
+copied lock in the test fixture) before re-running integration.
+
+Browser / VDOM smoke against a live fruit server:
+
+```sh
+cd examples/fruit && sheets serve   # http://localhost:4400
+# then, from the sheets root:
+bun -e '/* see SPA_SMOKE notes in session history, or load the page in a browser */'
+```
 
 ### Rebuild the local mirror
 

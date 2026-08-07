@@ -629,9 +629,52 @@ td input.celledit { width: 100%; border: none; background: transparent; padding:
 .focus { flex: 1; display: flex; min-height: 0; }
 .focus .pane { padding: 10px; overflow-y: auto; }
 .focus .meta { width: 220px; border-right: 1px solid var(--border); }
-.focus .code { flex: 1; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-.focus .code textarea { flex: 1; font: 12px/1.5 ui-monospace, monospace; border: none; border-radius: 0;
-  padding: 10px; resize: none; background: var(--bg); }
+.focus .code { flex: 1; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
+.focus .code-toolbar {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+  padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--bg2);
+}
+.focus .code-hint { color: var(--dim); font-size: 11px; }
+/* m-js docs-style code editor: line gutter + highlighted <pre> under a transparent textarea.
+   Shared font/padding/line-height so the caret never drifts; white-space:pre (no wrap). */
+.focus .code-editor {
+  flex: 1; min-height: 0; display: grid; grid-template-columns: auto 1fr;
+  background: var(--bg);
+}
+.focus .ed-lines,
+.focus .ed-hl,
+.focus .ed-in {
+  margin: 0; border: 0; padding: 10px 12px;
+  font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre; overflow-wrap: normal; word-break: normal; tab-size: 2;
+  letter-spacing: normal;
+}
+.focus .ed-lines {
+  grid-column: 1; overflow: hidden; pointer-events: none; user-select: none;
+  text-align: right; color: var(--dim); background: var(--bg2);
+  border-right: 1px solid var(--border); padding-right: 10px; min-width: 3.2em;
+}
+.focus .ed { position: relative; grid-column: 2; min-width: 0; min-height: 0; }
+.focus .ed-hl, .focus .ed-in {
+  position: absolute; inset: 0;
+}
+.focus .ed-hl {
+  overflow: hidden; pointer-events: none; color: var(--text); background: transparent;
+}
+.focus .ed-in {
+  width: 100%; height: 100%; resize: none; outline: none; overflow: auto;
+  background: transparent; color: transparent; caret-color: var(--accent);
+  border-radius: 0;
+}
+.focus .ed-in::selection { background: rgba(77, 157, 224, .28); }
+.focus .ed-in::-webkit-scrollbar { width: 9px; height: 9px; }
+.focus .ed-in::-webkit-scrollbar-thumb { background: #2a2d36; border-radius: 4px; }
+/* token colors (aligned with m-js docs) */
+.focus .tok-cmt { color: #6a7380; font-style: italic; }
+.focus .tok-str { color: #7dcea0; }
+.focus .tok-kw { color: #c792ea; }
+.focus .tok-num { color: #f0c674; }
+.focus .tok-fn { color: #7fd1ff; }
 .focus .bench { width: 30%; display: flex; flex-direction: column; }
 .focus .bench .results { flex: 1; overflow-y: auto; font: 11px/1.5 ui-monospace, monospace; }
 .focus .bench .r-ok { color: var(--done); }

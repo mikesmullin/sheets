@@ -1,4 +1,6 @@
-// sheets SPA (§6). Local m-js distribution symlinked from /workspace/m-js/dist/m.js.
+// sheets SPA (§6). Local m-js runtime: public/m.js (hard-linked from m-js dist/).
+// m.js v3.2+ uses keyed VDOM reconciliation — redraws with unchanged state write
+// nothing; reactive writes schedule one coalesced frame redraw automatically.
 // Layout per Wireframe A: toolbars (Α), column letters (Κ), row rail (Λ), magic row (Β),
 // cells (Γ), selection (Ι), activity tabs (Δ), queue (Ζ), slider (Η), run log (Μ),
 // Angela chat (Ε/Θ). Stage focus mode (§9) at #/stage/<slug>.
@@ -15,7 +17,7 @@ const MAX_COL_WIDTH = 960
 // Rendered rows always retain their natural content height.
 const V_OVERSCAN = 32          // rows above/below viewport (fling headroom)
 const V_FULL_LOAD_MAX = 500    // one response remains bounded; larger sheets window rows
-const V_SCROLL_IDLE_MS = 160   // after this quiet period, flush deferred redraws
+const V_SCROLL_IDLE_MS = 160   // after this quiet period, flush deferred virtual-window commits
 const normalizeRowHeight = (height) => {
   const n = Math.round(Number(height))
   if (!Number.isFinite(n)) return ROWH
@@ -38,6 +40,111 @@ const normalizeColWidth = (width) => {
   return Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, n))
 }
 
+// ---- Stage source editor (m-js docs-style highlighted textarea) ----
+// Transparent textarea over a highlighted <pre>; shared metrics so the caret
+// never drifts. CoffeeScript-oriented highlighter; no word-wrap.
+const hlEsc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+function hlStash() {
+  const box = []
+  return {
+    put: (html) => String.fromCharCode(0xe000 + box.push(html) - 1),
+    pop: (s) => s.replace(/[\uE000-\uEFFF]/g, (c) => box[c.charCodeAt(0) - 0xe000]),
+  }
+}
+function highlightCoffee(src) {
+  const st = hlStash()
+  let s = hlEsc(src)
+  // block comments ### ... ###
+  s = s.replace(/###[\s\S]*?###/g, (m) => st.put(`<span class="tok-cmt">${m}</span>`))
+  // line comments
+  s = s.replace(/(^|[^:])#(?!\{)[^\n]*/gm, (m) => st.put(`<span class="tok-cmt">${m}</span>`))
+  // strings (single, double, triple)
+  s = s.replace(/'''[\s\S]*?'''|"""[\s\S]*?"""|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/g,
+    (m) => st.put(`<span class="tok-str">${m}</span>`))
+  // regex /.../ (simple; after = or operators)
+  s = s.replace(/(^|[=:(,\[!&|?+\-*/%<>]\s*)(\/(?:\\.|[^/\n])+\/[gimsuy]*)/g,
+    (m, pre, re) => pre + st.put(`<span class="tok-str">${re}</span>`))
+  // keywords
+  s = s.replace(
+    /\b(export|import|from|default|class|extends|super|return|if|else|unless|then|when|switch|for|of|in|while|until|loop|break|continue|try|catch|finally|throw|new|typeof|delete|do|by|own|and|or|not|is|isnt|yes|no|on|off|true|false|null|undefined|this|await|async|yield|function|=>|->)\b/g,
+    (m) => st.put(`<span class="tok-kw">${m}</span>`),
+  )
+  // numbers
+  s = s.replace(/\b0x[\da-fA-F]+\b|\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b/g,
+    (m) => st.put(`<span class="tok-num">${m}</span>`))
+  // function names before (
+  s = s.replace(/\b([A-Za-z_$][\w$]*)(?=\s*[=\(])/g,
+    (m) => st.put(`<span class="tok-fn">${m}</span>`))
+  return st.pop(s)
+}
+
+// Ephemeral bookkeeping MUST NOT live on the reactive root (`this`).
+// M.mount wraps the app in a proxy: any `this.foo = …` schedules deferredBatchRedraw.
+// Putting rAF handles / load caches on `this` caused a permanent redraw loop
+// (redraw → rt.stageMountRaf = id → invalidate → redraw → …).
+const rt = {
+  stageMountHookInstalled: false,
+  stageMountRaf: 0,
+  stageMounts: new Map(),
+  viewMods: Object.create(null),       // slug → module | null
+  viewLoading: Object.create(null),    // slug → bool
+  viewPromises: Object.create(null),
+  viewGen: Object.create(null),
+  viewSourceHash: Object.create(null),
+  viewRedrawPending: false,
+  forceNextViewRedraw: false,
+  stageReloadTimers: Object.create(null),
+  // virtual window / scroll (not rendered directly)
+  scrollIdleTimer: 0,
+  scrollRaf: 0,
+  scrollTop: 0,
+  scrollLeft: 0,
+  scrollVel: 0,
+  scrollDirty: false,
+  lastScrollTop: 0,
+  lastScrollT: 0,
+  gridUserScrollAt: 0,
+  programmaticGridScroll: false,
+  pendingWindow: false,
+  pendingFirst: null,
+  pendingAssembled: null,
+  ensureRunning: false,
+  ensurePromise: null,
+  ensureQueued: false,
+  ensureReset: false,
+  ensureReload: false,
+  fullLoaded: false,
+  totalKnown: false,
+  windowGen: 0,
+  windowKey: '',
+  fetchInflight: null,
+  // misc UI chrome that is not template state
+  dragSel: false,
+  suppressColClick: false,
+  suppressRowClick: false,
+  logProgrammaticScroll: false,
+  logStickPending: false,
+  logUserScrollAt: 0,
+  searchDebounce: null,
+  filterDebounce: null,
+  logFilterDebounce: null,
+  toastT: 0,
+  chatClockGen: 0,
+  colValuePath: Object.create(null),
+  filterOutsideBound: null,
+  onFilterOutside: null,
+  stageMeta: Object.create(null),
+}
+
+function clearViewCaches() {
+  rt.viewMods = Object.create(null)
+  rt.viewLoading = Object.create(null)
+  rt.viewPromises = Object.create(null)
+  rt.viewGen = Object.create(null)
+  rt.viewSourceHash = Object.create(null)
+  rt.forceNextViewRedraw = true
+}
+
 function createApp() {
   return {
   // ---- state ----
@@ -46,7 +153,7 @@ function createApp() {
   // Virtual window: bodyOffsetY positions rendered rows via transform; totalBodyH is the rock-solid spacer.
   bodyOffsetY: 0, totalBodyH: 0,
   sel: { ranges: [], active: null, anchor: null },
-  cellStates: {}, stagePending: {}, viewMods: {}, viewLoading: {},
+  cellStates: {}, stagePending: {},
   wsConnected: false, wsConnecting: false,
   desynced: false,
   q: { queued: 0, idle: 0, running: 0, done: 0, error: 0, concurrency: 0 },
@@ -96,7 +203,7 @@ function createApp() {
   // ---- derived ----
   get act() { return this.meta?.activities?.find((a) => a.slug === this.actSlug) ?? this.meta?.activities?.[0] ?? null },
   get refreshCount() { return M.refreshCount },
-  get throttledRefreshCount() { return M.throttledRefreshCount },
+  get renderCount() { return M.renderCount },
   get pageCount() { return Math.max(1, Math.ceil((this.total || 0) / this.pageSize)) },
   get pageLabel() { return `${Math.min(this.page + 1, this.pageCount)} / ${this.pageCount}` },
   // Full ordered catalog (includes hidden). Grid/A1 use `columns` (visible only).
@@ -149,21 +256,16 @@ function createApp() {
   },
 
   async init() {
-    // Full m-js redraw destroys #app (including .gridwrap) and kills scroll momentum.
-    // Wrap redraw to (1) restore scrollTop and (2) defer redraws while the user is
-    // actively flinging the grid — that destroy/recreate cycle is the main recoil.
-    if (!M._sheetsScrollWrap) {
-      M._sheetsScrollWrap = true
+    // m.js v3.2+ diffs the tree; scroll containers and focus survive redraws.
+    // Stage cells may still install imperative views.mount widgets that live
+    // outside the VDOM — re-sync those after redraws that change cell hosts.
+    // IMPORTANT: do not write rAF handles onto `this` (reactive) from this hook.
+    if (!rt.stageMountHookInstalled) {
+      rt.stageMountHookInstalled = true
       const rawRedraw = M.redraw.bind(M)
       const self = this
-      M.redraw = (options = {}) => {
-        const force = options?.force === true || self._forceRedraw === true
-        if (self._isGridScrollHot() && !self._preservingScroll && !force) {
-          self._pendingRedraw = true
-          self._scheduleScrollIdleFlush()
-          return
-        }
-        self.preserveUiScroll(() => rawRedraw(force ? { ...options, force: true } : options))
+      M.redraw = () => {
+        rawRedraw()
         self.scheduleStageMounts()
       }
     }
@@ -180,13 +282,13 @@ function createApp() {
   },
   // True while the user is mid-gesture on the grid (wheel/trackpad/thumb).
   _isGridScrollHot() {
-    const at = this._gridUserScrollAt ?? 0
+    const at = rt.gridUserScrollAt ?? 0
     return at > 0 && (performance.now() - at) < V_SCROLL_IDLE_MS
   },
   _scheduleScrollIdleFlush() {
-    if (this._scrollIdleTimer) clearTimeout(this._scrollIdleTimer)
-    this._scrollIdleTimer = setTimeout(() => {
-      this._scrollIdleTimer = 0
+    if (rt.scrollIdleTimer) clearTimeout(rt.scrollIdleTimer)
+    rt.scrollIdleTimer = setTimeout(() => {
+      rt.scrollIdleTimer = 0
       this._flushScrollIdle()
     }, V_SCROLL_IDLE_MS)
   },
@@ -195,29 +297,21 @@ function createApp() {
       this._scheduleScrollIdleFlush()
       return
     }
-    // Apply deferred virtual-window commit first (state only), then one redraw.
-    if (this._pendingWindow && this._pendingAssembled) {
-      this.winStart = this._pendingFirst ?? 0
-      this.rows = this._pendingAssembled
+    // Apply deferred virtual-window commit (state only). Reactive assignment of
+    // rows/winStart schedules one coalesced VDOM redraw automatically.
+    if (rt.pendingWindow && rt.pendingAssembled) {
+      this.winStart = rt.pendingFirst ?? 0
+      this.rows = rt.pendingAssembled
       this.bodyOffsetY = this.winStart * ROWH
-      this._pendingAssembled = null
-      this._pendingFirst = null
-      this._pendingWindow = false
-      this._pendingRedraw = true
-    }
-    const needRedraw = this._pendingRedraw
-    const needWindow = this._scrollDirty
-    this._pendingRedraw = false
-    this._scrollDirty = false
-    if (needWindow && !(this._fullLoaded && this._canFullLoad())) {
-      this.ensureWindow({ reset: false })
-    }
-    if (needRedraw) {
-      this._forceRedraw = true
-      try { M.redraw() } finally { this._forceRedraw = false }
-      // The pending virtual-window path updates rows here rather than through
-      // _commitWindow, so it must explicitly mount the freshly redrawn cells.
+      rt.pendingAssembled = null
+      rt.pendingFirst = null
+      rt.pendingWindow = false
       this.scheduleStageMounts()
+    }
+    const needWindow = rt.scrollDirty
+    rt.scrollDirty = false
+    if (needWindow && !(rt.fullLoaded && this._canFullLoad())) {
+      this.ensureWindow({ reset: false })
     }
   },
 
@@ -249,7 +343,7 @@ function createApp() {
     if (this.chat.enabled) await this.loadChatConfig()
     if (!this.actSlug) this.actSlug = this.meta.activities[0]?.slug ?? null
     this.loadPaginationPrefs()
-    this._colValuePath = {}
+    rt.colValuePath = {}
     this.restoreColFilters()
     await this.refreshWindow(resetWindow)
     const [fieldData, stageData] = await Promise.all([
@@ -416,9 +510,9 @@ function createApp() {
     if (!col) return null
     if (col.field) return col.field
     if (col.stage) {
-      if (this._colValuePath[ci]) return this._colValuePath[ci]
+      if (rt.colValuePath[ci]) return rt.colValuePath[ci]
       const path = await this.stageWritePath(col.stage)
-      if (path) this._colValuePath[ci] = path
+      if (path) rt.colValuePath[ci] = path
       return path
     }
     return null
@@ -428,12 +522,12 @@ function createApp() {
     this.applySearchDraft(value, { immediate: false })
   },
   applySearchDraft(value, { immediate = false } = {}) {
-    if (this._searchDebounce) {
-      clearTimeout(this._searchDebounce)
-      this._searchDebounce = null
+    if (rt.searchDebounce) {
+      clearTimeout(rt.searchDebounce)
+      rt.searchDebounce = null
     }
     const run = async () => {
-      this._searchDebounce = null
+      rt.searchDebounce = null
       const text = String(value ?? '')
       if (text) {
         try { new RegExp(text) } catch {
@@ -464,12 +558,12 @@ function createApp() {
       }
     }
     if (immediate) run()
-    else this._searchDebounce = setTimeout(run, 500)
+    else rt.searchDebounce = setTimeout(run, 500)
   },
   clearSearch() {
-    if (this._searchDebounce) {
-      clearTimeout(this._searchDebounce)
-      this._searchDebounce = null
+    if (rt.searchDebounce) {
+      clearTimeout(rt.searchDebounce)
+      rt.searchDebounce = null
     }
     this.searchDraft = ''
     this.applySearchDraft('', { immediate: true })
@@ -535,34 +629,34 @@ function createApp() {
     })
   },
   _invalidateWindowState() {
-    this._windowKey = this._windowCacheKey()
-    this._windowGen = (this._windowGen ?? 0) + 1
-    this._totalKnown = false
-    this._fullLoaded = false
-    this._fetchInflight = null
+    rt.windowKey = this._windowCacheKey()
+    rt.windowGen = (rt.windowGen ?? 0) + 1
+    rt.totalKnown = false
+    rt.fullLoaded = false
+    rt.fetchInflight = null
   },
   // Small sheets can paint every row. Larger sheets retain a bounded native-height window.
   _canFullLoad() {
-    return this._totalKnown && this.total >= 0 && this.total <= V_FULL_LOAD_MAX
+    return rt.totalKnown && this.total >= 0 && this.total <= V_FULL_LOAD_MAX
   },
   // Direct range fetch — no page cache. Concurrent callers share one in-flight promise
   // only when the request range+key match; otherwise the newer gen wins.
   async _fetchEntities(offset, limit) {
     offset = Math.max(0, offset | 0)
     limit = Math.max(0, Math.min(V_FULL_LOAD_MAX, limit | 0))
-    const keyAtStart = this._windowKey ?? this._windowCacheKey()
-    const genAtStart = this._windowGen ?? 0
+    const keyAtStart = rt.windowKey ?? this._windowCacheKey()
+    const genAtStart = rt.windowGen ?? 0
     try {
       const params = await this.entityParams(offset, limit)
       const data = await (await fetch(`/api/entities?${params}`)).json()
-      if ((this._windowGen ?? 0) !== genAtStart || this._windowKey !== keyAtStart) {
+      if ((rt.windowGen ?? 0) !== genAtStart || rt.windowKey !== keyAtStart) {
         return null // stale after filter/activity change
       }
       const total = data.total ?? 0
       const rows = data.rows ?? []
       const off = data.offset ?? offset
       this.total = total
-      this._totalKnown = true
+      rt.totalKnown = true
       this.totalBodyH = Math.max(0, total * ROWH)
       return { offset: off, rows, total }
     } catch (err) {
@@ -592,22 +686,22 @@ function createApp() {
   _visibleRange() {
     const el = document.querySelector('.gridwrap')
     const live = el?.scrollTop
-    const scrollTop = (live != null && !this._programmaticGridScroll)
+    const scrollTop = (live != null && !rt.programmaticGridScroll)
       ? live
-      : (this._scrollTop ?? live ?? 0)
-    if (live != null && !this._programmaticGridScroll) this._scrollTop = live
+      : (rt.scrollTop ?? live ?? 0)
+    if (live != null && !rt.programmaticGridScroll) rt.scrollTop = live
     const vh = el?.clientHeight ?? 600
     const viewportRows = Math.max(1, Math.ceil(vh / ROWH))
     let overTop = V_OVERSCAN
     let overBot = V_OVERSCAN
-    const vel = this._scrollVel ?? 0
+    const vel = rt.scrollVel ?? 0
     if (vel > 1.2) overBot = V_OVERSCAN * 2
     else if (vel < -1.2) overTop = V_OVERSCAN * 2
     const visibleFirst = Math.max(0, Math.floor(scrollTop / ROWH))
     const visibleLast = visibleFirst + viewportRows
     const first = Math.max(0, visibleFirst - overTop)
     let count = viewportRows + overTop + overBot
-    if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first))
+    if (rt.totalKnown) count = Math.min(count, Math.max(0, this.total - first))
     return { first, count, vel, scrollTop, visibleFirst, visibleLast, viewportRows }
   },
   // True when the currently painted window still covers the viewport + a safety margin.
@@ -630,11 +724,13 @@ function createApp() {
           assembled[assembled.length - 1]?.id === this.rows[this.rows.length - 1]?.id
         ))
       if (same) return false
-      // During an active fling, never rebuild the DOM — that kills momentum.
+      // During an active fling, defer the heavy x-for window swap so the main
+      // thread stays free for the scroll compositor. VDOM keeps .gridwrap (and
+      // scrollTop) intact either way — this is about work, not node survival.
       if (this._isGridScrollHot()) {
-        this._pendingWindow = true
-        this._pendingFirst = first
-        this._pendingAssembled = assembled
+        rt.pendingWindow = true
+        rt.pendingFirst = first
+        rt.pendingAssembled = assembled
         this._scheduleScrollIdleFlush()
         return false
       }
@@ -643,35 +739,30 @@ function createApp() {
     this.rows = assembled
     this.bodyOffsetY = first * ROWH
     if (!this.totalBodyH && this.total) this.totalBodyH = this.total * ROWH
-    this._gridWindowCommit = true
-    this._forceRedraw = true
-    try { M.redraw() } finally {
-      this._forceRedraw = false
-      this._gridWindowCommit = false
-    }
+    // Reactive writes schedule one coalesced frame redraw; no manual M.redraw.
     this.scheduleStageMounts()
     return true
   },
   async ensureWindow({ reset = false, reload = false } = {}) {
     // Coalesce concurrent callers (scroll rAF + refreshWindow).
-    if (this._ensureRunning) {
-      this._ensureQueued = true
-      if (reset) this._ensureReset = true
-      if (reload) this._ensureReload = true
-      return this._ensurePromise
+    if (rt.ensureRunning) {
+      rt.ensureQueued = true
+      if (reset) rt.ensureReset = true
+      if (reload) rt.ensureReload = true
+      return rt.ensurePromise
     }
-    this._ensureRunning = true
-    this._ensurePromise = (async () => {
+    rt.ensureRunning = true
+    rt.ensurePromise = (async () => {
       try {
         let passes = 0
         do {
           if (++passes > 8) break
-          this._ensureQueued = false
-          this._scrollDirty = false
-          const doReset = reset || this._ensureReset
-          const doReload = reload || this._ensureReload || doReset
-          this._ensureReset = false
-          this._ensureReload = false
+          rt.ensureQueued = false
+          rt.scrollDirty = false
+          const doReset = reset || rt.ensureReset
+          const doReload = reload || rt.ensureReload || doReset
+          rt.ensureReset = false
+          rt.ensureReload = false
           reset = false
           reload = false
 
@@ -679,24 +770,24 @@ function createApp() {
           if (doReset) {
             this._invalidateWindowState()
             if (el) {
-              this._programmaticGridScroll = true
+              rt.programmaticGridScroll = true
               el.scrollTop = 0
-              this._programmaticGridScroll = false
+              rt.programmaticGridScroll = false
             }
-            this._scrollTop = 0
-            this._scrollVel = 0
-            this._lastScrollTop = 0
+            rt.scrollTop = 0
+            rt.scrollVel = 0
+            rt.lastScrollTop = 0
           } else if (doReload) {
             // Keep scroll and keep _fullLoaded so rowHeightMode stays rows-natural
             // during the await — flipping to rows-fixed mid-reload collapses tall
             // rows (row 2 "teleports" up, then down when heights restore).
-            this._windowGen = (this._windowGen ?? 0) + 1
+            rt.windowGen = (rt.windowGen ?? 0) + 1
           }
           const key = this._windowCacheKey()
-          if (key !== this._windowKey) this._invalidateWindowState()
+          if (key !== rt.windowKey) this._invalidateWindowState()
 
           // Bootstrap total if unknown.
-          if (!this._totalKnown) {
+          if (!rt.totalKnown) {
             const boot = await this._fetchEntities(0, 1)
             if (!boot) break
           }
@@ -710,39 +801,39 @@ function createApp() {
             const first = this.page * this.pageSize
             const data = await this._fetchEntities(first, this.pageSize)
             if (!data) break
-            this._fullLoaded = false
+            rt.fullLoaded = false
             this._commitWindow(first, data.rows, { force: true })
             break
           }
 
           // ---- Full-load path (small sheets): paint everything; native scroll ----
-          if (this._canFullLoad() || (doReload && this._fullLoaded)) {
-            if (!this._fullLoaded || doReload) {
+          if (this._canFullLoad() || (doReload && rt.fullLoaded)) {
+            if (!rt.fullLoaded || doReload) {
               const data = await this._fetchEntities(0, Math.max(this.total || 1, 1))
               if (!data) break
               if (data.total > V_FULL_LOAD_MAX) {
-                this._fullLoaded = false
-                this._ensureQueued = true
+                rt.fullLoaded = false
+                rt.ensureQueued = true
                 continue
               }
-              this._fullLoaded = true
+              rt.fullLoaded = true
               this._commitWindow(0, data.rows, { force: true })
             }
             break
           }
-          this._fullLoaded = false
+          rt.fullLoaded = false
 
           // ---- Windowed path: rows keep natural height; ROWH estimates spacers ----
           let { first, count, visibleFirst, visibleLast } = this._visibleRange()
           if (!doReload && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) break
-          if (!doReload && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) break
+          if (!doReload && rt.totalKnown && this._windowCoversView(visibleFirst, visibleLast)) break
 
           count = Math.min(count, V_FULL_LOAD_MAX)
           const data = await this._fetchEntities(first, Math.max(count, 1))
           if (!data) break
 
           ;({ first, count } = this._visibleRange())
-          if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first), V_FULL_LOAD_MAX)
+          if (rt.totalKnown) count = Math.min(count, Math.max(0, this.total - first), V_FULL_LOAD_MAX)
           let assembled = data.offset === first ? data.rows : null
           if (!assembled) {
             const again = await this._fetchEntities(first, Math.max(count, 1))
@@ -750,13 +841,13 @@ function createApp() {
             assembled = again.rows
           }
           this._commitWindow(first, assembled.slice(0, count), { force: doReload || doReset })
-        } while (this._ensureQueued || this._scrollDirty)
+        } while (rt.ensureQueued || rt.scrollDirty)
       } finally {
-        this._ensureRunning = false
-        this._ensurePromise = null
+        rt.ensureRunning = false
+        rt.ensurePromise = null
       }
     })()
-    return this._ensurePromise
+    return rt.ensurePromise
   },
   // Public API: reset=true → scroll to top + reload; false → reload in place (mutations).
   async refreshWindow(reset) {
@@ -766,12 +857,12 @@ function createApp() {
   resetGridScrollTop() {
     const el = document.querySelector('.gridwrap')
     if (el) {
-      this._programmaticGridScroll = true
-      try { el.scrollTop = 0 } finally { this._programmaticGridScroll = false }
+      rt.programmaticGridScroll = true
+      try { el.scrollTop = 0 } finally { rt.programmaticGridScroll = false }
     }
-    this._scrollTop = 0
-    this._scrollVel = 0
-    this._lastScrollTop = 0
+    rt.scrollTop = 0
+    rt.scrollVel = 0
+    rt.lastScrollTop = 0
   },
   setPage(nextPage) {
     const page = Math.max(0, Math.min(Number(nextPage) || 0, this.pageCount - 1))
@@ -796,39 +887,34 @@ function createApp() {
     this.refreshWindow(false)
   },
   onScroll(e) {
-    // Ignore only our own programmatic restores (setting scrollTop after M.redraw).
-    if (this._programmaticGridScroll) return
+    // Ignore programmatic scrollTop writes (e.g. resetGridScrollTop).
+    if (rt.programmaticGridScroll) return
     const el = e?.target ?? document.querySelector('.gridwrap')
     if (!el) return
     const now = performance.now()
     const top = el.scrollTop
-    if (this._lastScrollT != null) {
-      const dt = Math.max(1, now - this._lastScrollT)
-      this._scrollVel = (top - (this._lastScrollTop ?? top)) / dt // px/ms
+    if (rt.lastScrollT != null) {
+      const dt = Math.max(1, now - rt.lastScrollT)
+      rt.scrollVel = (top - (rt.lastScrollTop ?? top)) / dt // px/ms
     }
-    this._lastScrollTop = top
-    this._lastScrollT = now
-    this._scrollTop = top
-    this._scrollLeft = el.scrollLeft
-    this._gridUserScrollAt = now
+    rt.lastScrollTop = top
+    rt.lastScrollT = now
+    rt.scrollTop = top
+    rt.scrollLeft = el.scrollLeft
+    rt.gridUserScrollAt = now
     this._scheduleScrollIdleFlush()
 
-    // Pagination still needs this snapshot for redraw restoration; it simply
-    // does not need virtual-window fetching below.
+    // Pagination only needs the snapshot above (page jumps reset scroll).
     if (this.usePagination) return
 
-    // Full-load sheets: native scroll only — never ensureWindow/redraw on scroll.
-    if (this._fullLoaded && this._canFullLoad()) return
+    // Full-load sheets: native scroll only — never ensureWindow on scroll.
+    if (rt.fullLoaded && this._canFullLoad()) return
 
-    if (this._preservingScroll) {
-      this._scrollDirty = true
-      return
-    }
-    this._scrollDirty = true
-    if (!this._scrollRaf) {
-      this._scrollRaf = requestAnimationFrame(() => {
-        this._scrollRaf = 0
-        if (!this._scrollDirty) return
+    rt.scrollDirty = true
+    if (!rt.scrollRaf) {
+      rt.scrollRaf = requestAnimationFrame(() => {
+        rt.scrollRaf = 0
+        if (!rt.scrollDirty) return
         this.ensureWindow({ reset: false })
       })
     }
@@ -878,32 +964,32 @@ function createApp() {
   },
   ensureView(slug, { force = false } = {}) {
     if (!slug) return Promise.resolve(null)
-    if (!this._viewPromises) this._viewPromises = {}
-    if (!this._viewGen) this._viewGen = {}
-    if (!this._viewSourceHash) this._viewSourceHash = {}
+    if (!rt.viewPromises) rt.viewPromises = {}
+    if (!rt.viewGen) rt.viewGen = {}
+    if (!rt.viewSourceHash) rt.viewSourceHash = {}
     // Cache hit (unless force).
-    if (!force && this.viewMods[slug] !== undefined) return Promise.resolve(this.viewMods[slug])
+    if (!force && rt.viewMods[slug] !== undefined) return Promise.resolve(rt.viewMods[slug])
     // Share in-flight load (including force — don't stack parallel force fetches).
-    if (this.viewLoading[slug] && this._viewPromises[slug]) return this._viewPromises[slug]
-    const gen = (this._viewGen[slug] ?? 0) + 1
-    this._viewGen[slug] = gen
-    this.viewLoading[slug] = true
-    const hadPrevious = this.viewMods[slug] != null
-    const prevHash = this._viewSourceHash[slug]
+    if (rt.viewLoading[slug] && rt.viewPromises[slug]) return rt.viewPromises[slug]
+    const gen = (rt.viewGen[slug] ?? 0) + 1
+    rt.viewGen[slug] = gen
+    rt.viewLoading[slug] = true
+    const hadPrevious = rt.viewMods[slug] != null
+    const prevHash = rt.viewSourceHash[slug]
     const p = this._fetchStageViewsCode(slug)
       .then(async (code) => {
-        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        if (rt.viewGen[slug] !== gen) return rt.viewMods[slug] ?? null
         const hash = this._hashStr(code)
         // A forced reload may be caused by a changed browser-safe lib. The
         // stage Coffee source hash can be identical in that case, so re-import.
         const m = await this._importStageViews(slug, hash)
-        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
-        this.viewMods[slug] = m
-        this._viewSourceHash[slug] = hash
+        if (rt.viewGen[slug] !== gen) return rt.viewMods[slug] ?? null
+        rt.viewMods[slug] = m
+        rt.viewSourceHash[slug] = hash
         return { mod: m, changed: force || !hadPrevious || prevHash !== hash }
       })
       .then((result) => {
-        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
+        if (rt.viewGen[slug] !== gen) return rt.viewMods[slug] ?? null
         if (result && typeof result === 'object' && 'mod' in result) {
           if (result.changed) this.scheduleViewRedraw()
           return result.mod
@@ -913,42 +999,38 @@ function createApp() {
       })
       .catch((err) => {
         console.warn('ensureView failed', slug, err)
-        if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
-        if (!hadPrevious) this.viewMods[slug] = null
-        return this.viewMods[slug] ?? null
+        if (rt.viewGen[slug] !== gen) return rt.viewMods[slug] ?? null
+        if (!hadPrevious) rt.viewMods[slug] = null
+        return rt.viewMods[slug] ?? null
       })
       .finally(() => {
-        if (this._viewGen[slug] === gen) {
-          this.viewLoading[slug] = false
-          delete this._viewPromises[slug]
+        if (rt.viewGen[slug] === gen) {
+          rt.viewLoading[slug] = false
+          delete rt.viewPromises[slug]
         }
       })
-    this._viewPromises[slug] = p
+    rt.viewPromises[slug] = p
     return p
   },
   scheduleViewRedraw() {
-    if (this._viewRedrawPending) return
-    this._viewRedrawPending = true
+    if (rt.viewRedrawPending) return
+    rt.viewRedrawPending = true
     requestAnimationFrame(() => {
-      this._viewRedrawPending = false
-      const force = this._forceNextViewRedraw === true
-      this._forceNextViewRedraw = false
-      if (force) {
-        M.redraw({ force: true })
-        this.scheduleStageMounts()
-      } else {
-        this.redrawGrid()
-      }
+      rt.viewRedrawPending = false
+      // View module cache changed out of band (not a reactive field write) —
+      // request one explicit redraw so cellHtml re-evaluates against new views.
+      rt.forceNextViewRedraw = false
+      this.redrawGrid()
     })
   },
   // Coalesce bursty signals (tool_result + stages_updated + WS) into one trailing reload.
   // No long cooldown — content-hash still skips redraw when source is unchanged.
   scheduleStageViewReload(slug, { delay = 80 } = {}) {
     if (!slug) return
-    if (!this._stageReloadTimers) this._stageReloadTimers = {}
-    clearTimeout(this._stageReloadTimers[slug])
-    this._stageReloadTimers[slug] = setTimeout(() => {
-      delete this._stageReloadTimers[slug]
+    if (!rt.stageReloadTimers) rt.stageReloadTimers = {}
+    clearTimeout(rt.stageReloadTimers[slug])
+    rt.stageReloadTimers[slug] = setTimeout(() => {
+      delete rt.stageReloadTimers[slug]
       this.reloadStageView(slug)
     }, delay)
   },
@@ -962,7 +1044,7 @@ function createApp() {
     if (!col) return ''
     if (col.stage) {
       this.ensureView(col.stage)
-      const mod = this.viewMods[col.stage]
+      const mod = rt.viewMods[col.stage]
       if (mod?.views?.cell) {
         try { return mod.views.cell(row.doc, { entityId: row.id })?.template ?? '' } catch (e) { return `<span class="cellstate">⚠ ${esc(e.message)}</span>` }
       }
@@ -973,24 +1055,17 @@ function createApp() {
     return ''
   },
   stageCellKey(rowId, stage) { return `${rowId}|${stage}` },
-  scheduleStageMounts({ retry = true } = {}) {
-    if (this._stageMountRaf) return
-    this._stageMountRaf = requestAnimationFrame(() => {
-      this._stageMountRaf = 0
+  scheduleStageMounts() {
+    if (rt.stageMountRaf) return
+    rt.stageMountRaf = requestAnimationFrame(() => {
+      rt.stageMountRaf = 0
+      // Run after the frame's VDOM commit so .cell-inner nodes are current.
       this.syncStageMounts()
-      // A throttled root redraw can leave this pass ahead of fresh cell DOM.
-      // Retry once after the MJS throttle window so interactive views mount.
-      if (retry && !this._stageMountRetryTimer) {
-        this._stageMountRetryTimer = setTimeout(() => {
-          this._stageMountRetryTimer = null
-          this.scheduleStageMounts({ retry: false })
-        }, 550)
-      }
     })
   },
   /** After paint: call optional views.mount(el, ctx) on stage cells; unmount stale ones. */
   syncStageMounts() {
-    if (!this._stageMounts) this._stageMounts = new Map()
+    if (!rt.stageMounts) rt.stageMounts = new Map()
     const seen = new Set()
     const viewport = document.querySelector('.gridwrap')?.getBoundingClientRect()
     const top = (viewport?.top ?? 0) - 320
@@ -1008,12 +1083,14 @@ function createApp() {
       const col = this.columns[ci]
       if (!row?.id || !col?.stage) continue
       const slug = col.stage
-      const mod = this.viewMods[slug]
+      const mod = rt.viewMods[slug]
       if (!mod?.views?.mount) continue
       const key = this.stageCellKey(row.id, slug)
       seen.add(key)
-      const prev = this._stageMounts.get(key)
-      // Remount when DOM node was replaced (x-html rewrite) or entity id changed.
+      const prev = rt.stageMounts.get(key)
+      // Remount only when the RawHTML host node was rewritten (x-html string
+      // change) or the entity under this key changed. Unchanged x-html keeps
+      // the same node under VDOM, so mounts survive ordinary redraws.
       if (prev && prev.el === inner && prev.slug === slug && prev.id === row.id) continue
       if (prev?.unmount) {
         try { prev.unmount() } catch {}
@@ -1027,14 +1104,14 @@ function createApp() {
       } catch (err) {
         console.warn('views.mount failed', slug, err)
       }
-      this._stageMounts.set(key, { el: inner, slug, id: row.id, unmount })
+      rt.stageMounts.set(key, { el: inner, slug, id: row.id, unmount })
     }
-    for (const [key, prev] of [...this._stageMounts.entries()]) {
+    for (const [key, prev] of [...rt.stageMounts.entries()]) {
       if (seen.has(key)) continue
       if (prev?.unmount) {
         try { prev.unmount() } catch {}
       }
-      this._stageMounts.delete(key)
+      rt.stageMounts.delete(key)
     }
   },
   makeStageViewCtx(row, ci, stage) {
@@ -1075,22 +1152,21 @@ function createApp() {
       isStageEditing: () => app.stageEditing?.id === entityId && app.stageEditing?.stage === stage,
       getStageEditDraft: () => app.stageEditing?.id === entityId && app.stageEditing?.stage === stage ? app.stageEditing.draft : null,
       showToast: (msg) => app.showToast(msg),
-      redraw: () => { M.redraw(); app.scheduleStageMounts() },
+      // Explicit escape hatch for mount widgets that mutate outside the reactive
+      // root (rare). Prefer writing reactive fields so the auto-redraw fires.
+      redraw: () => { M.redraw() },
     }
   },
   openStageEditor(editor) {
     if (!editor?.key || !editor?.component) return
     this.stageEditor = editor
-    M.redraw({ force: true })
   },
   isStageEditorCell(row, ci) {
     return this.stageEditor?.entityId === row?.id && this.stageEditor?.columnIndex === ci
   },
   closeStageEditor() {
-    const key = this.stageEditor?.key
+    // Clearing stageEditor toggles the cell's x-if; x-mount runs destroy() on remove.
     this.stageEditor = null
-    if (key) M.unmountComponent?.(key)
-    M.redraw({ force: true })
   },
   /** Generic entity patch: { component: { fieldOrNestedPath: value } } via PATCH API. */
   async patchEntity(id, patch) {
@@ -1109,7 +1185,6 @@ function createApp() {
       const doc = result.doc
       if (doc) {
         this.rows = this.rows.map((row) => row.id === id ? { ...row, doc } : row)
-        M.redraw()
         this.scheduleStageMounts()
       }
       return doc
@@ -1132,7 +1207,7 @@ function createApp() {
       if (!response.ok || !result.ok) throw new Error(result.error ?? `RPC failed (${response.status})`)
       if (result.doc) {
         this.rows = this.rows.map((row) => row.id === id ? { ...row, doc: result.doc } : row)
-        this.redrawGrid()
+        this.scheduleStageMounts()
       }
       this.showToast(result.message ?? `${stage}: ${method} complete`)
       return result
@@ -1147,7 +1222,7 @@ function createApp() {
     if (!a) return false
     const col = this.columns[a.c]
     if (!col?.stage) return false
-    const mod = this.viewMods[col.stage]
+    const mod = rt.viewMods[col.stage]
     if (typeof mod?.views?.onKey !== 'function') return false
     const i = a.r - this.winStart
     const row = this.rows[i]
@@ -1244,16 +1319,16 @@ function createApp() {
       this.sel.anchor = { r, c: ci }
     }
     this.sel.active = { r, c: ci }
-    this._dragSel = true
+    rt.dragSel = true
   },
   cellOver(i, ci, e) {
-    if (!this._dragSel || !(e.buttons & 1)) return
+    if (!rt.dragSel || !(e.buttons & 1)) return
     const a = this.sel.anchor; if (!a) return
     const r = this.absRow(i)
     this.sel.ranges[this.sel.ranges.length - 1] = { r0: Math.min(a.r, r), c0: Math.min(a.c, ci), r1: Math.max(a.r, r), c1: Math.max(a.c, ci) }
     this.sel.active = { r, c: ci }
   },
-  cellUp() { this._dragSel = false },
+  cellUp() { rt.dragSel = false },
   clearSelection() {
     if (!this.sel.ranges.length && !this.sel.active) return
     this.sel = { ranges: [], active: null, anchor: null }
@@ -1266,7 +1341,7 @@ function createApp() {
     this.clearSelection()
   },
   colHeadClick(ci, e) {
-    if (this.colResize?.moved || this._suppressColClick) return
+    if (this.colResize?.moved || rt.suppressColClick) return
     if (e.altKey) return this.toggleSort(ci)
     const range = { r0: 0, c0: ci, r1: Math.max(0, this.total - 1), c1: ci }
     if (e.ctrlKey || e.metaKey) this.sel.ranges.push(range)
@@ -1316,8 +1391,8 @@ function createApp() {
       this.colResize = null
       this.resizing = false
       if (draft?.moved) {
-        this._suppressColClick = true
-        setTimeout(() => { this._suppressColClick = false }, 0)
+        rt.suppressColClick = true
+        setTimeout(() => { rt.suppressColClick = false }, 0)
       }
       M.redraw()
       if (!draft?.moved) return
@@ -1397,7 +1472,7 @@ function createApp() {
     const previousCursor = document.body.style.cursor
     const previousSelect = document.body.style.userSelect
     this.rowResize = { id: row.id, startY, startH, moved: false }
-    this._suppressRowClick = false
+    rt.suppressRowClick = false
     document.body.style.cursor = 'row-resize'
     document.body.style.userSelect = 'none'
     document.querySelector('table.grid')?.classList.add('row-resizing')
@@ -1415,7 +1490,7 @@ function createApp() {
       document.body.style.cursor = previousCursor
       document.body.style.userSelect = previousSelect
       document.querySelector('table.grid')?.classList.remove('row-resizing')
-      if (this.rowResize?.moved) this._suppressRowClick = true
+      if (this.rowResize?.moved) rt.suppressRowClick = true
       this.rowResize = null
       M.redraw()
     }
@@ -1424,8 +1499,8 @@ function createApp() {
     window.addEventListener('pointercancel', up)
   },
   rowHeadClick(i, e) {
-    if (this._suppressRowClick) {
-      this._suppressRowClick = false
+    if (rt.suppressRowClick) {
+      rt.suppressRowClick = false
       return
     }
     const r = this.absRow(i)
@@ -1590,7 +1665,7 @@ function createApp() {
         const el = document.querySelector('.gridwrap')
         if (el) {
           el.scrollTop = Math.max(0, el.scrollTop + dir * page * ROWH)
-          this._scrollTop = el.scrollTop
+          rt.scrollTop = el.scrollTop
           this.onScroll({ target: el })
         }
       }
@@ -1674,8 +1749,8 @@ function createApp() {
     }
     const maxTop = Math.max(0, el.scrollHeight - el.clientHeight)
     if (el.scrollTop > maxTop) el.scrollTop = maxTop
-    this._scrollTop = el.scrollTop
-    this._scrollDirty = true
+    rt.scrollTop = el.scrollTop
+    rt.scrollDirty = true
     this.onScroll({ target: el })
     this.ensureWindow({ reset: false })
   },
@@ -1765,13 +1840,13 @@ function createApp() {
     return typeof value === 'object' ? JSON.stringify(value) : String(value)
   },
   async stageMeta(stage) {
-    const mod = this.viewMods[stage]
+    const mod = rt.viewMods[stage]
     if (mod?.meta) return mod.meta
-    this._stageMeta ??= {}
-    if (!this._stageMeta[stage]) {
-      this._stageMeta[stage] = fetch(`/api/stage/${encodeURIComponent(stage)}`).then((response) => response.json())
+    rt.stageMeta ??= {}
+    if (!rt.stageMeta[stage]) {
+      rt.stageMeta[stage] = fetch(`/api/stage/${encodeURIComponent(stage)}`).then((response) => response.json())
     }
-    return (await this._stageMeta[stage]).meta ?? null
+    return (await rt.stageMeta[stage]).meta ?? null
   },
   async stageWritePath(stage) {
     return (await this.stageMeta(stage))?.writes?.[0] ?? null
@@ -1781,7 +1856,7 @@ function createApp() {
     if (!col) return ''
     if (col.field) return this.clipboardValue(getPath(row.doc, col.field))
     if (col.stage) {
-      const mod = this.viewMods[col.stage] ?? await this.ensureView(col.stage)
+      const mod = rt.viewMods[col.stage] ?? await this.ensureView(col.stage)
       if (typeof mod?.views?.copy === 'function') {
         try { return this.clipboardValue(await mod.views.copy(row.doc)) } catch { /* use display/persisted fallback */ }
       }
@@ -1826,7 +1901,7 @@ function createApp() {
     if (col?.stage) {
       const i = a.r - this.winStart
       const row = this.rows[i]; if (!row) return
-      const mod = this.viewMods[col.stage]
+      const mod = rt.viewMods[col.stage]
       if (typeof mod?.views?.beginEdit === 'function') {
         try {
           mod.views.beginEdit(this.makeStageViewCtx(row, a.c, col.stage), replaceWith)
@@ -1866,7 +1941,6 @@ function createApp() {
       const result = await response.json()
       if (!response.ok || !result.ok) throw new Error(result.error ?? `save failed (${response.status})`)
       this.rows = this.rows.map((row) => row.id === ed.id ? { ...row, doc: result.doc } : row)
-      M.redraw()
       this.scheduleStageMounts()
       this.showToast(`saved ${ed.id}.yaml`)
     } catch (error) {
@@ -1889,7 +1963,7 @@ function createApp() {
     const col = this.columns[ci]
     if (col?.stage) {
       this.ensureView(col.stage)
-      return this.viewMods[col.stage]?.meta?.title ?? col.stage
+      return rt.viewMods[col.stage]?.meta?.title ?? col.stage
     }
     if (col?.field) return col.field
     return null
@@ -1907,102 +1981,8 @@ function createApp() {
     }
     this.stagePending = pending
   },
-  scheduleCellVisualRedraw() {
-    if (this._cellVisualRedrawPending) return
-    this._cellVisualRedrawPending = true
-    requestAnimationFrame(() => {
-      this._cellVisualRedrawPending = false
-      this.redrawUi()
-    })
-  },
-  // m-js full redraw rebuilds the DOM and resets scroll containers; snapshot/restore.
-  // CRITICAL: never yank grid scrollTop back to a stale snap while the user is flinging —
-  // that was the scrollbar "recoil". Prefer live _scrollTop; skip follow-up if user moved.
-  preserveUiScroll(run) {
-    if (this._preservingScroll) return run()
-    this._preservingScroll = true
-    const grid = document.querySelector('.gridwrap')
-    const log = document.querySelector('.logbox')
-    const chat = document.querySelector('.chat .messages')
-    const nearBottom = (el, pad = 40) => !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= pad
-    // Prefer the scroll position the user is driving (onScroll), not a possibly-stale DOM read.
-    const gTop = this._scrollTop ?? grid?.scrollTop ?? 0
-    const gLeft = this._scrollLeft ?? grid?.scrollLeft ?? 0
-    const snap = {
-      gTop,
-      gLeft,
-      gridUserAt: this._gridUserScrollAt ?? 0,
-      logTop: log?.scrollTop ?? 0,
-      logPinned: this.logPinned,
-      logUserAt: this._logUserScrollAt ?? 0,
-      chatTop: chat?.scrollTop ?? 0,
-      chatPinned: nearBottom(chat),
-    }
-    try { run() } finally { this._preservingScroll = false }
-    this.restoreUiScroll(snap, { followUp: false })
-    // Follow-up only for log/chat layout; grid is restored once and then left alone
-    // unless the user has not scrolled since the snap (see restoreUiScroll).
-    this._scrollRestoreGen = (this._scrollRestoreGen ?? 0) + 1
-    const gen = this._scrollRestoreGen
-    requestAnimationFrame(() => {
-      if (gen !== this._scrollRestoreGen) return
-      this.restoreUiScroll(snap, { followUp: true })
-      // Scroll events during redraw only set the dirty flag — run ensure now.
-      if (this._scrollDirty && !this._scrollRaf) {
-        this._scrollRaf = requestAnimationFrame(() => {
-          this._scrollRaf = 0
-          if (!this._scrollDirty) return
-          this.ensureWindow({ reset: false })
-        })
-      }
-    })
-  },
-  restoreUiScroll(snap, { followUp = false } = {}) {
-    const g = document.querySelector('.gridwrap')
-    if (g) {
-      const userScrolledSince = (this._gridUserScrollAt ?? 0) > (snap.gridUserAt ?? 0)
-      // Follow-up must never yank the grid mid-fling (primary recoil cause).
-      if (followUp && userScrolledSince) {
-        // leave grid where the user put it
-      } else {
-        // Live user intent always wins; snap is only a fallback.
-        const top = this._scrollTop ?? snap.gTop
-        const left = this._scrollLeft ?? snap.gLeft
-        if (Math.abs((g.scrollTop ?? 0) - top) > 0.5 || Math.abs((g.scrollLeft ?? 0) - left) > 0.5) {
-          this._programmaticGridScroll = true
-          try {
-            g.scrollTop = top
-            g.scrollLeft = left
-          } finally {
-            this._programmaticGridScroll = false
-          }
-        }
-        this._scrollTop = g.scrollTop
-        this._scrollLeft = g.scrollLeft
-      }
-    }
-    const l = document.querySelector('.logbox')
-    if (l) {
-        if (this._fullLoaded && this._canFullLoad()) {
-          this.scheduleStageMounts()
-          return
-        }
-      if (snap.logPinned && this.logPinned) {
-        this._logProgrammaticScroll = true
-        l.scrollTop = l.scrollHeight
-        this._logProgrammaticScroll = false
-      } else if (!userScrolledSince) {
-        // only re-apply the pre-redraw offset when the user hasn't moved the log since
-        this._logProgrammaticScroll = true
-        l.scrollTop = snap.logTop
-        this._logProgrammaticScroll = false
-      }
-      // follow-up must never re-pin or override a live user scroll
-      if (!followUp && snap.logPinned) this.logPinned = true
-    }
-    const c = document.querySelector('.chat .messages')
-    if (c) c.scrollTop = snap.chatPinned ? c.scrollHeight : snap.chatTop
-  },
+  // Explicit redraw for out-of-band invalidation (view module swap, HMR method
+  // patch). Prefer reactive field writes — those auto-schedule one frame redraw.
   redrawUi() { M.redraw() },
   isLogNearBottom(el, threshold = 40) {
     if (!el) return true
@@ -2012,23 +1992,23 @@ function createApp() {
     if (!this.logPinned) return
     const el = document.querySelector('.logbox')
     if (!el) return
-    this._logProgrammaticScroll = true
+    rt.logProgrammaticScroll = true
     el.scrollTop = el.scrollHeight
-    this._logProgrammaticScroll = false
-    // second frame: reactive x-for may still be laying out new lines
+    rt.logProgrammaticScroll = false
+    // Second frame: x-for may still be inserting log lines after the diff.
     requestAnimationFrame(() => {
       const box = document.querySelector('.logbox')
       if (!box || !this.logPinned) return
-      this._logProgrammaticScroll = true
+      rt.logProgrammaticScroll = true
       box.scrollTop = box.scrollHeight
-      this._logProgrammaticScroll = false
+      rt.logProgrammaticScroll = false
     })
   },
   scheduleLogStick() {
-    if (!this.logPinned || this._logStickPending) return
-    this._logStickPending = true
+    if (!this.logPinned || rt.logStickPending) return
+    rt.logStickPending = true
     requestAnimationFrame(() => {
-      this._logStickPending = false
+      rt.logStickPending = false
       this.stickLogToBottom()
     })
   },
@@ -2190,9 +2170,7 @@ function createApp() {
     } catch {
       this.filterValues = { ci, loading: false, items: [], sampled: 0, distinct: 0 }
     }
-    // The facet response often lands inside the normal redraw cooldown after
-    // opening the menu. Force this one completion paint so Top values appears.
-    M.redraw({ force: true })
+    // filterValues assignment is reactive — auto-redraw shows Top values.
   },
   valuePct(item) {
     const sampled = this.filterValues?.sampled ?? 0
@@ -2239,9 +2217,9 @@ function createApp() {
     }
     // Switching columns: flush the previous draft first.
     if (this.filterMenu && this.filterMenu.ci !== ci) {
-      if (this._filterDebounce) {
-        clearTimeout(this._filterDebounce)
-        this._filterDebounce = null
+      if (rt.filterDebounce) {
+        clearTimeout(rt.filterDebounce)
+        rt.filterDebounce = null
       }
       this.applyFilterDraft(this.filterMenu.ci, this.filterDraft, { immediate: true })
     }
@@ -2255,9 +2233,9 @@ function createApp() {
   _bindFilterMenuOutside() {
     // m-js @click.outside calls the handler without `this`, so we bind our own
     // document listener while the menu is open.
-    if (this._filterOutsideBound) return
-    this._filterOutsideBound = true
-    this._onFilterOutside = (ev) => {
+    if (rt.filterOutsideBound) return
+    rt.filterOutsideBound = true
+    rt.onFilterOutside = (ev) => {
       if (!this.filterMenu) return
       const t = ev.target
       // One menu node exists per column (x-for); do not querySelector the first hidden one.
@@ -2266,20 +2244,20 @@ function createApp() {
     }
     // next tick so the opening click does not immediately close
     setTimeout(() => {
-      if (this.filterMenu) document.addEventListener('click', this._onFilterOutside, true)
+      if (this.filterMenu) document.addEventListener('click', rt.onFilterOutside, true)
     }, 0)
   },
   _unbindFilterMenuOutside() {
-    if (!this._filterOutsideBound) return
-    document.removeEventListener('click', this._onFilterOutside, true)
-    this._filterOutsideBound = false
-    this._onFilterOutside = null
+    if (!rt.filterOutsideBound) return
+    document.removeEventListener('click', rt.onFilterOutside, true)
+    rt.filterOutsideBound = false
+    rt.onFilterOutside = null
   },
   closeFilterMenu() {
     if (!this.filterMenu) return
-    if (this._filterDebounce) {
-      clearTimeout(this._filterDebounce)
-      this._filterDebounce = null
+    if (rt.filterDebounce) {
+      clearTimeout(rt.filterDebounce)
+      rt.filterDebounce = null
     }
     // Flush any pending draft before close so a quick close still applies.
     this.applyFilterDraft(this.filterMenu.ci, this.filterDraft, { immediate: true })
@@ -2292,12 +2270,12 @@ function createApp() {
     this.applyFilterDraft(ci, value, { immediate: false })
   },
   applyFilterDraft(ci, value, { immediate = false } = {}) {
-    if (this._filterDebounce) {
-      clearTimeout(this._filterDebounce)
-      this._filterDebounce = null
+    if (rt.filterDebounce) {
+      clearTimeout(rt.filterDebounce)
+      rt.filterDebounce = null
     }
     const run = async () => {
-      this._filterDebounce = null
+      rt.filterDebounce = null
       const text = String(value ?? '')
       const next = { ...this.colFilters }
       if (!text) delete next[ci]
@@ -2339,12 +2317,12 @@ function createApp() {
       }
     }
     if (immediate) run()
-    else this._filterDebounce = setTimeout(run, 500)
+    else rt.filterDebounce = setTimeout(run, 500)
   },
   clearFilterInput(ci) {
-    if (this._filterDebounce) {
-      clearTimeout(this._filterDebounce)
-      this._filterDebounce = null
+    if (rt.filterDebounce) {
+      clearTimeout(rt.filterDebounce)
+      rt.filterDebounce = null
     }
     this.filterDraft = ''
     this.applyFilterDraft(ci, '', { immediate: true })
@@ -2356,9 +2334,9 @@ function createApp() {
     })
   },
   clearColumnFilter(ci) {
-    if (this._filterDebounce) {
-      clearTimeout(this._filterDebounce)
-      this._filterDebounce = null
+    if (rt.filterDebounce) {
+      clearTimeout(rt.filterDebounce)
+      rt.filterDebounce = null
     }
     this.filterDraft = ''
     if (!this.columnHasFilter(ci)) {
@@ -2574,8 +2552,8 @@ function createApp() {
     return true
   },
   redrawGrid() {
+    // M.redraw wrapper already schedules stage mounts after the commit.
     M.redraw()
-    this.scheduleStageMounts()
   },
   componentChecked(group) { return group.fields.length > 0 && group.fields.every((field) => this.hasFieldColumn(field.path)) },
   async toggleComponent(group) {
@@ -2680,7 +2658,7 @@ function createApp() {
     this.colFilterNot = {}
     this.colFilterPicks = {}
     this.saveColFilters()
-    this._colValuePath = {}
+    rt.colValuePath = {}
     M.redraw()
     this.showToast(`saved ${field}`)
   },
@@ -2817,30 +2795,26 @@ function createApp() {
   // ---- websocket ----
   connectWS() {
     this.wsConnecting = true
-    M.redraw()
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/run`)
-    ws.onopen = () => { this.wsConnecting = false; this.wsConnected = true; M.redraw() }
+    ws.onopen = () => { this.wsConnecting = false; this.wsConnected = true }
     ws.onmessage = (m) => {
       const ev = JSON.parse(m.data)
       if (ev.type === 'queue') { this.q = ev; if (!this.dragging) this.conc = ev.concurrency }
       else if (ev.type === 'cells') {
         this.cellStates = Object.fromEntries(ev.cells.map((cell) => [`${cell.id}|${cell.stage}`, cell]))
         this.syncStagePending()
-        this.scheduleCellVisualRedraw()
       }
       else if (ev.type === 'cell') {
         this.cellStates = { ...this.cellStates, [`${ev.entity}|${ev.stage}`]: { state: ev.state, error: ev.error } }
         this.syncStagePending()
-        this.scheduleCellVisualRedraw()
       }
-      else if (ev.type === 'queue-cleared') { this.cellStates = {}; this.stagePending = {}; M.redraw() }
+      else if (ev.type === 'queue-cleared') { this.cellStates = {}; this.stagePending = {} }
       else if (ev.type === 'log') this.pushLog(ev)
       else if (ev.type === 'persisted') this.queuePersistedReload(ev)
     }
     ws.onclose = () => {
       this.wsConnecting = false
       this.wsConnected = false
-      M.redraw()
       setTimeout(() => this.connectWS(), 2000)
     }
   },
@@ -2851,13 +2825,13 @@ function createApp() {
   },
   logScroll(e) {
     // Ignore programmatic stick-to-bottom / post-redraw restores so they don't unpin.
-    if (this._logProgrammaticScroll) return
-    this._logUserScrollAt = performance.now()
+    if (rt.logProgrammaticScroll) return
+    rt.logUserScrollAt = performance.now()
     this.logPinned = this.isLogNearBottom(e.currentTarget)
   },
   logWheel(e) {
     // Wheel fires before scroll position updates; mark user intent and re-check pin after.
-    this._logUserScrollAt = performance.now()
+    rt.logUserScrollAt = performance.now()
     requestAnimationFrame(() => {
       const el = document.querySelector('.logbox')
       if (!el) return
@@ -2877,9 +2851,9 @@ function createApp() {
     this.applyLogFilter(value, { immediate: false })
   },
   clearLogFilter() {
-    if (this._logFilterDebounce) {
-      clearTimeout(this._logFilterDebounce)
-      this._logFilterDebounce = null
+    if (rt.logFilterDebounce) {
+      clearTimeout(rt.logFilterDebounce)
+      rt.logFilterDebounce = null
     }
     this.logFilterDraft = ''
     this.applyLogFilter('', { immediate: true })
@@ -2887,12 +2861,12 @@ function createApp() {
     requestAnimationFrame(() => document.getElementById('sheets-log-filter-input')?.focus())
   },
   applyLogFilter(value, { immediate = false } = {}) {
-    if (this._logFilterDebounce) {
-      clearTimeout(this._logFilterDebounce)
-      this._logFilterDebounce = null
+    if (rt.logFilterDebounce) {
+      clearTimeout(rt.logFilterDebounce)
+      rt.logFilterDebounce = null
     }
     const run = () => {
-      this._logFilterDebounce = null
+      rt.logFilterDebounce = null
       const text = String(value ?? '')
       if (text) {
         try {
@@ -2909,7 +2883,7 @@ function createApp() {
       this.scheduleLogStick()
     }
     if (immediate) run()
-    else this._logFilterDebounce = setTimeout(run, 1000)
+    else rt.logFilterDebounce = setTimeout(run, 1000)
   },
   get visibleLogs() {
     const src = this.logFilterRe ?? ''
@@ -2971,7 +2945,7 @@ function createApp() {
   },
   sliderDown(e) {
     this.dragging = { x: e.clientX, v: this.conc }
-    const move = (ev) => { if (this.dragging) { this.conc = Math.max(0, Math.min(64, Math.round(this.dragging.v + (ev.clientX - this.dragging.x) / 3))); M.redraw() } }
+    const move = (ev) => { if (this.dragging) { this.conc = Math.max(0, Math.min(64, Math.round(this.dragging.v + (ev.clientX - this.dragging.x) / 3))) } }
     const up = async () => {
       window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up)
       const n = this.conc; this.dragging = null
@@ -3027,8 +3001,8 @@ function createApp() {
     document.body.style.userSelect = 'none'
     const move = (event) => {
       const max = Math.max(360, window.innerWidth - 360)
+      // Reactive write → one coalesced frame redraw (no extra M.redraw per move).
       this.sidebarWidth = Math.max(300, Math.min(max, startW + startX - event.clientX))
-      M.redraw()
     }
     const up = () => {
       window.removeEventListener('pointermove', move)
@@ -3037,7 +3011,6 @@ function createApp() {
       document.body.style.cursor = previousCursor
       document.body.style.userSelect = previousSelect
       this.persistChatPrefs()
-      M.redraw()
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
@@ -3061,7 +3034,6 @@ function createApp() {
     document.body.style.userSelect = 'none'
     const move = (event) => {
       this.logHeight = Math.max(80, Math.min(max, startH + event.clientY - startY))
-      M.redraw()
     }
     const up = () => {
       window.removeEventListener('pointermove', move)
@@ -3070,7 +3042,6 @@ function createApp() {
       document.body.style.cursor = previousCursor
       document.body.style.userSelect = previousSelect
       this.persistChatPrefs()
-      M.redraw()
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
@@ -3260,12 +3231,14 @@ function createApp() {
   startChatClock() {
     this.stopChatClock(false)
     this.chat.startedAt = performance.now()
-    this._chatClockGen = (this._chatClockGen ?? 0) + 1
-    const gen = this._chatClockGen
+    rt.chatClockGen = (rt.chatClockGen ?? 0) + 1
+    const gen = rt.chatClockGen
     const tick = () => {
-      if (gen !== this._chatClockGen) return // stopped or superseded
+      if (gen !== rt.chatClockGen) return // stopped or superseded
       this.chat.elapsed = this.formatChatElapsed(performance.now() - this.chat.startedAt)
-      // Direct DOM patch every frame — never full M.redraw (destroys the whole grid).
+      // Direct DOM write for the clock only — a reactive write every rAF would
+      // schedule a full-tree VDOM walk every frame. Diffing is O(tree) even when
+      // almost nothing changes; the stopwatch is not worth that.
       const el = document.querySelector('.chat-elapsed')
       if (el) {
         el.textContent = this.chat.elapsed
@@ -3277,7 +3250,7 @@ function createApp() {
     this.chat.timer = requestAnimationFrame(tick)
   },
   stopChatClock(freeze = true) {
-    this._chatClockGen = (this._chatClockGen ?? 0) + 1 // invalidate in-flight rAF ticks
+    rt.chatClockGen = (rt.chatClockGen ?? 0) + 1 // invalidate in-flight rAF ticks
     if (this.chat.timer) {
       cancelAnimationFrame(this.chat.timer)
       try { clearInterval(this.chat.timer) } catch { /* legacy */ }
@@ -3413,8 +3386,8 @@ function createApp() {
             // Do not reload on done — tool_result + stages_updated already scheduled
             // a debounced reload. Extra done reloads caused redraw storms.
           }
-          // Throttle stream redraws — full M.redraw of the grid every NDJSON line is expensive.
-          this.scheduleChatStreamRedraw()
+          // asst.body / events mutate the reactive message object — m.js
+          // coalesces those writes into one deferredBatchRedraw per frame.
           const el = document.querySelector('.chat .messages'); if (el) el.scrollTop = el.scrollHeight
         }
       }
@@ -3427,23 +3400,7 @@ function createApp() {
       this.chat.busy = false
       this.chat.stopRequested = false
       this.speakChatMessage(asst)
-      M.redraw()
     }
-  },
-  // ~24fps while Angela streams (full grid redraw is expensive).
-  scheduleChatStreamRedraw() {
-    const minGap = 1000 / 24
-    const now = performance.now()
-    if (this._chatStreamRedrawPending) return
-    const wait = Math.max(0, minGap - (now - (this._chatStreamRedrawAt ?? 0)))
-    this._chatStreamRedrawPending = true
-    const fire = () => {
-      this._chatStreamRedrawPending = false
-      this._chatStreamRedrawAt = performance.now()
-      M.redraw()
-    }
-    if (wait === 0) requestAnimationFrame(fire)
-    else setTimeout(() => requestAnimationFrame(fire), wait)
   },
   // Extract stage slug from a chat tool event (file_io__write_file path).
   stageSlugFromToolPath(p) {
@@ -3474,6 +3431,47 @@ function createApp() {
     await fetch(`/api/stage/${this.focus.slug}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source: this.focus.source }) })
     this.showToast('saved')
   },
+  // Line numbers + highlighted overlay for the stage source editor.
+  get focusLineNumbers() {
+    const src = this.focus?.source ?? ''
+    const n = Math.max(1, src.split('\n').length)
+    let out = '1'
+    for (let i = 2; i <= n; i++) out += `\n${i}`
+    return out
+  },
+  get focusSourceHighlight() {
+    // Trailing newline keeps the last line height under the caret.
+    return `${highlightCoffee(this.focus?.source ?? '')}\n`
+  },
+  syncFocusEditorScroll(e) {
+    const root = e.currentTarget?.closest?.('.code-editor')
+    if (!root) return
+    const top = e.currentTarget.scrollTop
+    const left = e.currentTarget.scrollLeft
+    const hl = root.querySelector('.ed-hl')
+    const lines = root.querySelector('.ed-lines')
+    if (hl) { hl.scrollTop = top; hl.scrollLeft = left }
+    if (lines) lines.scrollTop = top
+  },
+  focusEditorKey(e) {
+    // Tab inserts two spaces instead of leaving the field (code-editor habit).
+    if (e.key !== 'Tab' || !this.focus) return
+    e.preventDefault()
+    const ta = e.currentTarget
+    const start = ta.selectionStart ?? 0
+    const end = ta.selectionEnd ?? 0
+    const src = this.focus.source ?? ''
+    const insert = '  '
+    this.focus.source = src.slice(0, start) + insert + src.slice(end)
+    // Restore caret after the reactive redraw.
+    const pos = start + insert.length
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.code-editor .ed-in')
+      if (!el) return
+      el.focus()
+      try { el.setSelectionRange(pos, pos) } catch { /* ignore */ }
+    })
+  },
   async benchRun(n) {
     this.focus.busy = true
     try {
@@ -3491,7 +3489,7 @@ function createApp() {
     return out
   },
 
-  showToast(msg) { this.toast = msg; clearTimeout(this._toastT); this._toastT = setTimeout(() => { this.toast = '' }, 2500) },
+  showToast(msg) { this.toast = msg; clearTimeout(rt.toastT); rt.toastT = setTimeout(() => { this.toast = '' }, 2500) },
 
   // ---- template ----
   template: `
@@ -3614,7 +3612,7 @@ function createApp() {
             <option value="5">5</option><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option>
           </select>
         </div>
-        <span class="refresh-monitor" :title="'MJS refresh requests: ' + refreshCount + ' · throttled: ' + throttledRefreshCount" x-text="'refresh ' + refreshCount"></span>
+        <span class="refresh-monitor" :title="'MJS redraw requests: ' + refreshCount + ' · committed: ' + renderCount" x-text="'redraw ' + refreshCount"></span>
         <div class="toolbar-end">
           <span class="play-summary" x-text="playSummaryLabel"></span>
           <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection (Ctrl/Cmd+G)">
@@ -3632,11 +3630,18 @@ function createApp() {
           <button @click="closeFocus()">← back to sheet</button>
         </div>
         <div class="code" x-show="focus">
-          <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+          <div class="code-toolbar">
             <button class="primary" @click="saveStage()">save</button>
-            <span style="color:var(--dim);font-size:11px">saving hot-reloads the stage; edits from Angela/your IDE appear live</span>
+            <span class="code-hint">CoffeeScript · Tab inserts 2 spaces · save hot-reloads the stage</span>
           </div>
-          <textarea x-model="focus.source" spellcheck="false"></textarea>
+          <div class="code-editor">
+            <pre class="ed-lines" aria-hidden="true" x-text="focusLineNumbers"></pre>
+            <div class="ed">
+              <pre class="ed-hl" aria-hidden="true" x-html="focusSourceHighlight"></pre>
+              <textarea class="ed-in" x-model="focus.source" spellcheck="false" autocomplete="off" autocapitalize="off"
+                @scroll="syncFocusEditorScroll($event)" @keydown="focusEditorKey($event)"></textarea>
+            </div>
+          </div>
         </div>
         <div class="pane bench" x-show="focus">
           <h3>test bench (dry-run, never persists)</h3>
@@ -4009,16 +4014,20 @@ async function boot(bust = 0) {
   const next = createApp()
   if (!window.__SHEETS_MOUNTED__) {
     window.__SHEETS_MOUNTED__ = true
+    // Factory returns the same object that becomes M.root (reactive proxy of next).
     M.mount('#app', () => next)
     bindGlobalPlayShortcut()
-    console.info('[sheets] mounted')
+    // m.js v3.2 runs init() on x-data / stores, not on M.mount roots — app owns boot.
+    if (typeof M.root?.init === 'function') await M.root.init()
+    console.info('[sheets] mounted', M.version)
     return
   }
   const root = M.root
   if (!root) {
     M.mount('#app', () => next)
     bindGlobalPlayShortcut()
-    console.info('[sheets] remounted', bust)
+    if (typeof M.root?.init === 'function') await M.root.init()
+    console.info('[sheets] remounted', bust, M.version)
     return
   }
   patchApp(root, next)
@@ -4027,13 +4036,10 @@ async function boot(bust = 0) {
     // A lib-only HMR update leaves the stage Coffee source hash unchanged.
     // Drop browser view-module caches so recycled virtual rows cannot mix old
     // and new renderers after a views.mjs edit.
-    root.viewMods = {}
-    root.viewLoading = {}
-    root._viewPromises = {}
-    root._viewSourceHash = {}
-    root._forceNextViewRedraw = true
+    clearViewCaches()
   }
-  M.redraw({ force: bust !== 0 })
+  // Methods/template may have changed without data writes — force one diff pass.
+  M.redraw()
   console.info('[sheets] hot reloaded', bust)
 }
 
