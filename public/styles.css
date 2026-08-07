@@ -257,6 +257,11 @@ table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 /* Ordinary cell text is selectable; resize modes below still suppress selection. */
 .grid td:not(.rowhead) { user-select: text; -webkit-user-select: text; }
 .grid td.rowhead { user-select: none; -webkit-user-select: none; }
+/* B+F: while dragging a multi-cell range, suppress native text selection so the
+   blue highlight doesn't wrap across rows — single-cell text remains selectable. */
+.gridwrap.cell-dragging td:not(.rowhead),
+.gridwrap.cell-dragging { user-select: none !important; -webkit-user-select: none !important; }
+.gridwrap.cell-dragging ::selection { background: transparent; }
 .grid tbody tr:nth-child(even) td:not(.rowhead) { background: #191b20; }
 /* column headers stick while scrolling vertically.
    z-index stack (low → high): body cells < body rowheads < scrolling thead cells

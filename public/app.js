@@ -278,6 +278,12 @@ function createApp() {
     this.connectWS()
     window.addEventListener('keydown', (e) => this.globalKey(e))
     window.addEventListener('hashchange', () => this.route())
+    // B+F: ensure drag state clears even if mouseup outside grid, and suppress
+    // native multi-cell text selection while cell-dragging.
+    window.addEventListener('mouseup', () => this.cellUp())
+    window.addEventListener('selectstart', (e) => {
+      if (rt.dragSel && this._isMultiCell()) e.preventDefault()
+    })
     this.route()
   },
   // True while the user is mid-gesture on the grid (wheel/trackpad/thumb).
@@ -1281,6 +1287,27 @@ function createApp() {
 
   // ---- selection (Ι) ----
   absRow(i) { return this.winStart + i },
+  _clearNativeSel() {
+    try { const s = window.getSelection(); if (s && !s.isCollapsed) s.removeAllRanges(); } catch {}
+  },
+  _isMultiCell() {
+    if (this.sel.ranges.length > 1) return true
+    const r = this.sel.ranges[this.sel.ranges.length - 1]
+    return !!(r && (r.r0 !== r.r1 || r.c0 !== r.c1))
+  },
+  _syncDragSelectMode() {
+    const wrap = document.querySelector('.gridwrap')
+    if (!wrap) return
+    if (rt.dragSel && this._isMultiCell()) {
+      wrap.classList.add('cell-dragging')
+      this._clearNativeSel()
+    } else if (!rt.dragSel) {
+      wrap.classList.remove('cell-dragging')
+    } else {
+      // dragging but still single-cell → keep text selectable
+      wrap.classList.remove('cell-dragging')
+    }
+  },
   cellDown(i, ci, e) {
     const toggle = e.target.closest?.('.json-toggle')
     if (toggle) {
@@ -1320,6 +1347,7 @@ function createApp() {
     }
     this.sel.active = { r, c: ci }
     rt.dragSel = true
+    this._syncDragSelectMode()
   },
   cellOver(i, ci, e) {
     if (!rt.dragSel || !(e.buttons & 1)) return
@@ -1327,8 +1355,12 @@ function createApp() {
     const r = this.absRow(i)
     this.sel.ranges[this.sel.ranges.length - 1] = { r0: Math.min(a.r, r), c0: Math.min(a.c, ci), r1: Math.max(a.r, r), c1: Math.max(a.c, ci) }
     this.sel.active = { r, c: ci }
+    this._syncDragSelectMode()
   },
-  cellUp() { rt.dragSel = false },
+  cellUp() {
+    rt.dragSel = false
+    document.querySelector('.gridwrap')?.classList.remove('cell-dragging')
+  },
   clearSelection() {
     if (!this.sel.ranges.length && !this.sel.active) return
     this.sel = { ranges: [], active: null, anchor: null }
