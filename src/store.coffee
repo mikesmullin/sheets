@@ -16,6 +16,7 @@ export class Store
   constructor: (@ws, opts = {}) ->
     @db = null
     @sources = new Set()
+    @rowCache = new Map()
     @memory = opts.memory ? false
     @import = { state: 'idle', source: null, completed: 0, total: 0, startedAt: null, finishedAt: null, error: null }
 
@@ -56,6 +57,7 @@ export class Store
     }
     try
       await @db.query "DELETE FROM entities WHERE source = $1", [dir]
+      @rowCache.set dir, new Map()
       n = 0
       for file in files
         { doc } = E.readEntityFile file
@@ -90,9 +92,13 @@ export class Store
       INSERT INTO entities (source, id, doc, mtime) VALUES ($1, $2, $3::jsonb, $4)
       ON CONFLICT (source, id) DO UPDATE SET doc = $3::jsonb, mtime = $4
     """, [source, id, JSON.stringify(doc), mtime]
+    cache = @rowCache.get(source) ? new Map()
+    cache.set id, { id, doc }
+    @rowCache.set source, cache
 
   remove: (source, id) ->
     await @db.query "DELETE FROM entities WHERE source = $1 AND id = $2", [source, id]
+    @rowCache.get(source)?.delete id
 
   count: (source, q = null) ->
     params = [source]
@@ -143,6 +149,9 @@ export class Store
   # one PGlite result can exhaust the WASM heap ("out of bounds memory access") and
   # permanently wedge the connection (every later query on it then fails the same way).
   allRows: (source, batchSize = 200) ->
+    cached = @rowCache.get source
+    if cached?
+      return Array.from(cached.values()).sort (a, b) -> String(a.id).localeCompare String(b.id)
     out = []
     offset = 0
     loop
@@ -151,6 +160,9 @@ export class Store
       out.push row for row in r.rows
       offset += r.rows.length
       break if r.rows.length < batchSize
+    cache = new Map()
+    cache.set row.id, row for row in out
+    @rowCache.set source, cache
     out
 
   # union of component.field dot-paths across docs (column picker).

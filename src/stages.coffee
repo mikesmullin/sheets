@@ -84,7 +84,17 @@ export class Stages
         compiledDir = path.join @ws.sheetsDir, '.compiled-stages'
         fs.mkdirSync compiledDir, recursive: true
         compiledFile = path.join compiledDir, "#{slug}.mjs"
-        fs.writeFileSync compiledFile, entry.js
+        # Bun caches static imports by URL. Stamp shared stage libraries so a
+        # newly compiled server stage cannot retain an older views.mjs module.
+        libDir = path.join @ws.sheetsDir, 'lib'
+        libVersion = 0
+        if fs.existsSync libDir
+          for file in fs.readdirSync libDir
+            try
+              mtime = fs.statSync(path.join(libDir, file)).mtimeMs
+              libVersion = mtime if mtime > libVersion
+        serverJs = entry.js.replace /(from\s+['"]\.\.\/lib\/[\w.-]+\.mjs)(['"])/g, "$1?v=#{Math.round libVersion}$2"
+        fs.writeFileSync compiledFile, serverJs
         url = "#{pathToFileURL(compiledFile).href}?v=#{entry.mtime}"
         entry.mod = await `import(url)`
       catch err

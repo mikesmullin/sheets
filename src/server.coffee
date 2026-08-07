@@ -155,6 +155,16 @@ export startServer = (opts = {}) ->
     return unless slug
     debounce "stage:#{slug}", 120, -> notifyStageWritten slug
 
+  # Browser-safe shared stage libraries (views.mjs, cell.mjs, k8-links.mjs)
+  # must also prompt view-module reloads. Server-only library changes still need
+  # a server restart because Bun caches their dynamic imports.
+  watchSafe path.join(ws.sheetsDir, 'lib'), (event, fname) ->
+    return unless fname? and String(fname).endsWith '.mjs'
+    debounce "stage-lib:#{fname}", 120, ->
+      stages.invalidate slug for slug in stages.list()
+      console.log "sheets: stage view library updated #{fname}"
+      persisted 'stage', { slug } for slug in stages.list()
+
   activitySources = new Map()
   watchSafe ws.activitiesDir, (event, fname) ->
     return unless fname?.match /\.ya?ml$/
@@ -414,7 +424,8 @@ export startServer = (opts = {}) ->
       sortField = url.searchParams.get 'sortField'
       dir = url.searchParams.get('dir') ? 'asc'
       offset = Number(url.searchParams.get('offset') ? 0)
-      limit = Math.min 500, Number(url.searchParams.get('limit') ? 100)
+      rawLimit = Number(url.searchParams.get('limit') or 100)
+      limit = Math.max 1, Math.min 500, (if Number.isFinite(rawLimit) and rawLimit > 0 then rawLimit else 100)
       q = url.searchParams.get('q') or null
       filterPaths = url.searchParams.getAll 'filterPath'
       filterRes = url.searchParams.getAll 'filterRe'
@@ -426,21 +437,17 @@ export startServer = (opts = {}) ->
         fstage = filterStages[i] ? ''
         continue unless fpath or fstage
         filters.push { path: fpath, re: re ? '', stage: fstage, not: String(filterNots[i] ? '') is '1' }
-      # Always go through queryEntities when sorting, filtering, or searching so
-      # user A–Z / regex prefs apply uniformly (stage.sort is default-only).
-      if sortPath or sortField or sortStage or filters.length or q or dir is 'desc'
-        result = await queryEntities a, {
-          offset, limit, q, dir
-          sortPath: sortPath or sortField or null
-          sortStage: if sortPath or sortField then null else sortStage
-          filters
-        }
-        total = result.total
-        offset = result.offset
-        rows = result.rows
-      else
-        total = await store.count a.source, q
-        rows = await store.window a.source, { offset, limit, dir, q }
+      # Always go through queryEntities so reads use store.allRows (bounded 200-row batches)
+      # and avoid PGlite WASM memory overflow ("out of bounds memory access") on large offset queries.
+      result = await queryEntities a, {
+        offset, limit, q, dir
+        sortPath: sortPath or sortField or null
+        sortStage: if sortPath or sortField then null else sortStage
+        filters
+      }
+      total = result.total
+      offset = result.offset
+      rows = result.rows
       df = displayFields a.source
       rows = for r in rows
         file = E.fileFor a.source, r.id
@@ -637,6 +644,14 @@ export startServer = (opts = {}) ->
         file = E.fileFor a.source, id
         return json { error: 'not found' }, 404 unless file
         { doc, body: mdBody } = E.readEntityFile file
+        if body.patch?
+          return json { error: 'patch must be an object' }, 400 unless typeof body.patch is 'object' and not Array.isArray body.patch
+          E.mergePatch doc, body.patch
+          E.writeEntityFile file, doc, mdBody
+          await store.upsert a.source, id, doc, fs.statSync(file).mtimeMs
+          persisted 'entity', { source: a.source, id }
+          engine.pump()
+          return json { ok: true, doc }
         component = String(body.component ? '').trim()
         field = String(body.field ? '')
         return json { error: 'component required' }, 400 unless component
@@ -750,6 +765,43 @@ export startServer = (opts = {}) ->
         distinct: values.length
         values: values.slice 0, limit
       }
+
+    # Stage RPC: an explicit, user-triggered stage command outside the run queue.
+    # A stage may export rpc(entity, method, ctx) and return { patch, message }.
+    if p is '/api/rpc' and req.method is 'POST'
+      body = await req.json()
+      a = resolveActivity body.activity
+      id = validEntityId body.id
+      stage = String(body.stage ? '').trim()
+      method = String(body.method ? '').trim()
+      return json { error: 'valid entity id required' }, 400 unless id
+      return json { error: 'stage required' }, 400 unless stage
+      return json { error: 'RPC method required' }, 400 unless method
+      return json { error: "stage not in activity: #{stage}" }, 403 unless (a.columns ? []).some (c) -> c.stage is stage
+      file = E.fileFor a.source, id
+      return json { error: 'not found' }, 404 unless file
+      try
+        mod = await stages.load stage
+      catch err
+        return json { error: String(err?.message ? err) }, 400
+      return json { error: "stage has no RPC handler: #{stage}" }, 404 unless typeof mod?.rpc is 'function'
+      { doc, body: mdBody } = E.readEntityFile file
+      log = (line) -> console.log "rpc #{stage}/#{method} #{id}: #{String(line ? '').slice(0, 500)}"
+      try
+        result = await mod.rpc doc, method, {
+          entityId: id, activity: a.slug, source: a.source, args: body.args ? null, signal: req.signal, log
+        }
+      catch err
+        return json { error: String(err?.message ? err) }, 500
+      result = {} unless result? and typeof result is 'object'
+      patch = result.patch ? null
+      if patch?
+        return json { error: 'RPC patch must be an object' }, 500 unless typeof patch is 'object' and not Array.isArray patch
+        E.mergePatch doc, patch
+        E.writeEntityFile file, doc, mdBody
+        await store.upsert a.source, id, doc, fs.statSync(file).mtimeMs
+        persisted 'entity', { source: a.source, id }
+      return json { ok: true, doc, message: result.message ? null, result: result.result ? null }
 
     # Stage modules are served at real URLs that mirror the on-disk layout, so the
     # browser's module loader resolves `../lib/*.mjs` natively (no blob/data URLs).

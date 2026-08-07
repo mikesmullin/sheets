@@ -1061,7 +1061,7 @@ function processElement(el, parentScope) {
             return;
           if (mounted !== child) {
             mounted = child;
-            mountComponent(el, child);
+            mountComponent(el, child, child.cacheKey);
           }
         });
         addCleanup(el, stop);
@@ -1520,6 +1520,89 @@ var instanceCache = new Map;
 var renderCount = 0;
 var alreadyRedrawing = false;
 var deferredQueued = false;
+var refreshRequestCount = 0;
+var throttledRefreshCount = 0;
+var lastRefreshAt = 0;
+var trailingRefreshTimer = null;
+var trailingRefreshPending = false;
+function refreshThrottleEnabled() {
+  return typeof globalThis === "undefined" || globalThis.__MJS_REFRESH_THROTTLE__ !== false;
+}
+function refreshThrottleMs() {
+  const configured = Number(typeof globalThis !== "undefined" ? globalThis.__MJS_REFRESH_THROTTLE_MS__ : 500);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 500;
+}
+function clearTrailingRefresh() {
+  if (trailingRefreshTimer != null) {
+    clearTimeout(trailingRefreshTimer);
+    trailingRefreshTimer = null;
+  }
+  trailingRefreshPending = false;
+}
+function scheduleTrailingRefresh(wait) {
+  if (trailingRefreshTimer != null)
+    return;
+  trailingRefreshTimer = setTimeout(() => {
+    trailingRefreshTimer = null;
+    if (!trailingRefreshPending)
+      return;
+    trailingRefreshPending = false;
+    performRedraw();
+  }, wait);
+}
+function performRedraw() {
+  if (alreadyRedrawing)
+    return;
+  alreadyRedrawing = true;
+  lastRefreshAt = Date.now();
+  try {
+    redrawCount++;
+    flushCount++;
+    if (!rootEl || !rootFactory)
+      return;
+    const active = document.activeElement;
+    const hadFocus = active && rootEl.contains(active) ? {
+      name: active.name,
+      id: active.id,
+      start: active.selectionStart,
+      end: active.selectionEnd
+    } : null;
+    if (!rootInstance) {
+      rootInstance = instantiate(rootFactory());
+      instanceCache.set("root", rootInstance);
+    }
+    destroyTree(rootEl);
+    rootEl.innerHTML = rootInstance.template || "";
+    elementData.set(rootEl, rootInstance);
+    for (const child of [...rootEl.children]) {
+      initTree(child, rootInstance);
+    }
+    if (typeof rootInstance.init === "function" && !rootInstance._inited) {
+      rootInstance._inited = true;
+      queueMicrotask(() => {
+        try {
+          rootInstance.init();
+        } catch (e) {
+          console.error(e);
+        }
+      });
+    }
+    if (hadFocus) {
+      const next = hadFocus.id ? rootEl.querySelector(`#${CSS.escape(hadFocus.id)}`) : hadFocus.name ? rootEl.querySelector(`[name="${hadFocus.name}"]`) : null;
+      if (next && next.focus) {
+        next.focus();
+        if (hadFocus.start != null && "setSelectionRange" in next) {
+          try {
+            next.setSelectionRange(hadFocus.start, hadFocus.end);
+          } catch (_) {}
+        }
+      }
+    }
+    renderCount++;
+  } finally {
+    alreadyRedrawing = false;
+  }
+}
 function instantiate(configOrFactory, attrs = {}) {
   let config = typeof configOrFactory === "function" ? configOrFactory(attrs) : configOrFactory;
   if (config == null || typeof config !== "object") {
@@ -1546,6 +1629,15 @@ function mountComponent(el, configOrFactory, cacheKey) {
   for (const child of [...el.children]) {
     initTree(child, instance);
   }
+  if (typeof instance.mounted === "function") {
+    queueMicrotask(() => {
+      try {
+        instance.mounted();
+      } catch (e) {
+        console.error(e);
+      }
+    });
+  }
   if (isNew && typeof instance.init === "function") {
     queueMicrotask(() => {
       try {
@@ -1556,6 +1648,17 @@ function mountComponent(el, configOrFactory, cacheKey) {
     });
   }
   return instance;
+}
+function unmountComponent(cacheKey) {
+  const instance = instanceCache.get(cacheKey);
+  if (!instance)
+    return;
+  if (typeof instance.destroy === "function") {
+    try {
+      instance.destroy();
+    } catch (_) {}
+  }
+  instanceCache.delete(cacheKey);
 }
 function clearInstances() {
   for (const inst of instanceCache.values()) {
@@ -1634,6 +1737,8 @@ var M = {
     M.redraw();
     return rootInstance;
   },
+  mountComponent,
+  unmountComponent,
   unmount() {
     if (rootEl) {
       destroyTree(rootEl);
@@ -1644,57 +1749,22 @@ var M = {
     rootFactory = null;
     Router.stop();
   },
-  redraw() {
-    if (alreadyRedrawing)
+  redraw(options = {}) {
+    refreshRequestCount++;
+    const force = options?.force === true;
+    if (force) {
+      clearTrailingRefresh();
+      performRedraw();
       return;
-    alreadyRedrawing = true;
-    try {
-      redrawCount++;
-      flushCount++;
-      if (!rootEl || !rootFactory)
-        return;
-      const active = document.activeElement;
-      const hadFocus = active && rootEl.contains(active) ? {
-        name: active.name,
-        id: active.id,
-        start: active.selectionStart,
-        end: active.selectionEnd
-      } : null;
-      if (!rootInstance) {
-        rootInstance = instantiate(rootFactory());
-        instanceCache.set("root", rootInstance);
-      }
-      destroyTree(rootEl);
-      rootEl.innerHTML = rootInstance.template || "";
-      elementData.set(rootEl, rootInstance);
-      for (const child of [...rootEl.children]) {
-        initTree(child, rootInstance);
-      }
-      if (typeof rootInstance.init === "function" && !rootInstance._inited) {
-        rootInstance._inited = true;
-        queueMicrotask(() => {
-          try {
-            rootInstance.init();
-          } catch (e) {
-            console.error(e);
-          }
-        });
-      }
-      if (hadFocus) {
-        const next = hadFocus.id ? rootEl.querySelector(`#${CSS.escape(hadFocus.id)}`) : hadFocus.name ? rootEl.querySelector(`[name="${hadFocus.name}"]`) : null;
-        if (next && next.focus) {
-          next.focus();
-          if (hadFocus.start != null && "setSelectionRange" in next) {
-            try {
-              next.setSelectionRange(hadFocus.start, hadFocus.end);
-            } catch (_) {}
-          }
-        }
-      }
-      renderCount++;
-    } finally {
-      alreadyRedrawing = false;
     }
+    const wait = refreshThrottleEnabled() ? Math.max(0, refreshThrottleMs() - (Date.now() - lastRefreshAt)) : 0;
+    if (wait > 0) {
+      throttledRefreshCount++;
+      trailingRefreshPending = true;
+      scheduleTrailingRefresh(wait);
+      return;
+    }
+    performRedraw();
   },
   deferredBatchRedraw() {
     if (deferredQueued)
@@ -1713,6 +1783,12 @@ var M = {
   },
   get drawCallCount() {
     return flushCount;
+  },
+  get refreshCount() {
+    return refreshRequestCount;
+  },
+  get throttledRefreshCount() {
+    return throttledRefreshCount;
   },
   takeDrawCalls,
   takePerfStats,

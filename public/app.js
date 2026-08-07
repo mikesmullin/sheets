@@ -11,12 +11,10 @@ const MAX_ROW_HEIGHT = 480
 const DEFAULT_COL_WIDTH = 180
 const MIN_COL_WIDTH = 60
 const MAX_COL_WIDTH = 960
-// Virtual scroll: fixed ROWH math when windowing, rAF scroll handling, deferred
-// M.redraw while flinging. No multi-page row cache — mutations always refetch.
-// Server caps /api/entities limit at 500 — at/under that we full-load and use
-// native scroll. Above that, edge-triggered windows with a direct range fetch.
+// Virtual scroll uses ROWH only to estimate the rendered window and spacers.
+// Rendered rows always retain their natural content height.
 const V_OVERSCAN = 32          // rows above/below viewport (fling headroom)
-const V_FULL_LOAD_MAX = 500    // match server limit; paint all rows, never shift window
+const V_FULL_LOAD_MAX = 500    // one response remains bounded; larger sheets window rows
 const V_SCROLL_IDLE_MS = 160   // after this quiet period, flush deferred redraws
 const normalizeRowHeight = (height) => {
   const n = Math.round(Number(height))
@@ -32,6 +30,7 @@ const copyColumns = (columns) => columns.map((column) => ({ ...column }))
 // Column filters are a per-user view preference, not sheet structure — they live in
 // localStorage so they never dirty the activity YAML or bump its revision.
 const COL_FILTER_KEY = 'sheets-col-filters'
+const COLLAPSED_ROWS_KEY = 'sheets-collapsed-row-ids'
 const escapeRe = (s) => String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const normalizeColWidth = (width) => {
   const n = Math.round(Number(width))
@@ -43,6 +42,7 @@ function createApp() {
   return {
   // ---- state ----
   meta: null, actSlug: null, total: 0, rows: [], winStart: 0, fields: [], fieldTree: [], stageTree: [], componentLocks: {},
+  usePagination: true, page: 0, pageSize: 10,
   // Virtual window: bodyOffsetY positions rendered rows via transform; totalBodyH is the rock-solid spacer.
   bodyOffsetY: 0, totalBodyH: 0,
   sel: { ranges: [], active: null, anchor: null },
@@ -60,6 +60,7 @@ function createApp() {
   sidebarWidth: 0, logHeight: 180, resizing: false,
   colResize: null, // { ci, width, startX, startW, moved }
   rowHeights: {}, // session-only id -> px; not persisted
+  collapsedRowIds: {}, // local preference: id -> true
   rowResize: null, // { id, startY, startH, moved }
   jsonExpanded: {}, // session-only cell|branch -> true; nested JSON stays lazy by default
   chat: {
@@ -88,11 +89,16 @@ function createApp() {
   searchDraft: '', // live toolbar search input
   _searchDebounce: null,
   focus: null, // {slug, source, meta, results, busy}
+  stageEditor: null, // { key, inputId, component } — stage-owned MJS component in the root outlet
   toast: '', tabMenu: null, tabRename: null,
   fieldMenu: false, columnPickerFilter: '',
 
   // ---- derived ----
   get act() { return this.meta?.activities?.find((a) => a.slug === this.actSlug) ?? this.meta?.activities?.[0] ?? null },
+  get refreshCount() { return M.refreshCount },
+  get throttledRefreshCount() { return M.throttledRefreshCount },
+  get pageCount() { return Math.max(1, Math.ceil((this.total || 0) / this.pageSize)) },
+  get pageLabel() { return `${Math.min(this.page + 1, this.pageCount)} / ${this.pageCount}` },
   // Full ordered catalog (includes hidden). Grid/A1 use `columns` (visible only).
   get fullColumns() { return this.act?.columns ?? [] },
   get columns() { return this.fullColumns.filter((c) => !c.hidden) },
@@ -150,18 +156,23 @@ function createApp() {
       M._sheetsScrollWrap = true
       const rawRedraw = M.redraw.bind(M)
       const self = this
-      M.redraw = () => {
-        if (self._isGridScrollHot() && !self._preservingScroll && !self._forceRedraw) {
+      M.redraw = (options = {}) => {
+        const force = options?.force === true || self._forceRedraw === true
+        if (self._isGridScrollHot() && !self._preservingScroll && !force) {
           self._pendingRedraw = true
           self._scheduleScrollIdleFlush()
           return
         }
-        self.preserveUiScroll(() => rawRedraw())
+        self.preserveUiScroll(() => rawRedraw(force ? { ...options, force: true } : options))
+        self.scheduleStageMounts()
       }
     }
     this.loadChatPrefs()
     this.loadColumnPickerFilter()
-    await this.loadMeta()
+    this.loadCollapsedRows()
+    // Keep the page restored from localStorage on the initial worksheet load.
+    // Later filter/sort/tab changes still deliberately reset to page one.
+    await this.loadMeta(false)
     this.connectWS()
     window.addEventListener('keydown', (e) => this.globalKey(e))
     window.addEventListener('hashchange', () => this.route())
@@ -204,6 +215,9 @@ function createApp() {
     if (needRedraw) {
       this._forceRedraw = true
       try { M.redraw() } finally { this._forceRedraw = false }
+      // The pending virtual-window path updates rows here rather than through
+      // _commitWindow, so it must explicitly mount the freshly redrawn cells.
+      this.scheduleStageMounts()
     }
   },
 
@@ -217,10 +231,12 @@ function createApp() {
       if (!exists) {
         history.replaceState(null, '', `${location.pathname}${location.search}`)
         this.actSlug = this.meta?.activities?.[0]?.slug ?? null
+        this.loadPaginationPrefs()
         this.restoreColFilters()
         this.refreshWindow(true)
       } else if (a[1] !== this.actSlug) {
         this.actSlug = a[1]
+        this.loadPaginationPrefs()
         this.restoreColFilters()
         this.refreshWindow(true)
       }
@@ -232,6 +248,7 @@ function createApp() {
     this.chat.enabled = this.meta.chat
     if (this.chat.enabled) await this.loadChatConfig()
     if (!this.actSlug) this.actSlug = this.meta.activities[0]?.slug ?? null
+    this.loadPaginationPrefs()
     this._colValuePath = {}
     this.restoreColFilters()
     await this.refreshWindow(resetWindow)
@@ -289,6 +306,32 @@ function createApp() {
   },
   loadColumnPickerFilter() {
     try { this.columnPickerFilter = localStorage.getItem('sheets-column-picker-filter') ?? '' } catch { /* storage unavailable */ }
+  },
+  paginationPrefsKey() { return `sheets-pagination:${this.actSlug ?? 'default'}` },
+  loadPaginationPrefs() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.paginationPrefsKey()) || 'null')
+      const page = Number(saved?.page ?? localStorage.getItem('sheets-page'))
+      const pageSize = Number(saved?.pageSize ?? localStorage.getItem('sheets-page-size'))
+      if (Number.isInteger(page) && page >= 0) this.page = page
+      if ([5, 10, 25, 50, 100].includes(pageSize)) this.pageSize = pageSize
+    } catch { /* storage unavailable */ }
+  },
+  savePaginationPrefs() {
+    try {
+      localStorage.setItem(this.paginationPrefsKey(), JSON.stringify({ page: this.page, pageSize: this.pageSize }))
+      localStorage.setItem('sheets-page', String(this.page))
+      localStorage.setItem('sheets-page-size', String(this.pageSize))
+    } catch { /* storage unavailable */ }
+  },
+  loadCollapsedRows() {
+    try {
+      const ids = JSON.parse(localStorage.getItem(COLLAPSED_ROWS_KEY) || '[]')
+      if (Array.isArray(ids)) this.collapsedRowIds = Object.fromEntries(ids.filter((id) => typeof id === 'string').map((id) => [id, true]))
+    } catch { /* storage unavailable or malformed preference */ }
+  },
+  saveCollapsedRows() {
+    try { localStorage.setItem(COLLAPSED_ROWS_KEY, JSON.stringify(Object.keys(this.collapsedRowIds))) } catch { /* storage unavailable */ }
   },
   setColumnPickerFilter(value) {
     this.columnPickerFilter = String(value ?? '')
@@ -498,7 +541,7 @@ function createApp() {
     this._fullLoaded = false
     this._fetchInflight = null
   },
-  // Small sheets: one fetch, paint every row, native scroll only (no window shifts).
+  // Small sheets can paint every row. Larger sheets retain a bounded native-height window.
   _canFullLoad() {
     return this._totalKnown && this.total >= 0 && this.total <= V_FULL_LOAD_MAX
   },
@@ -526,6 +569,25 @@ function createApp() {
       console.error('window fetch failed', err)
       return null
     }
+  },
+  // Fetch the entire filtered set, paging if a single response is truncated.
+  async _fetchAllEntities() {
+    const page = 500
+    let offset = 0
+    let total = null
+    const rows = []
+    while (total == null || offset < total) {
+      const data = await this._fetchEntities(offset, page)
+      if (!data) return null
+      total = data.total ?? 0
+      const batch = data.rows ?? []
+      if (!batch.length) break
+      for (const row of batch) rows.push(row)
+      offset = rows.length
+      if (batch.length < page) break
+      if (rows.length >= total) break
+    }
+    return { offset: 0, rows, total: total ?? rows.length }
   },
   _visibleRange() {
     const el = document.querySelector('.gridwrap')
@@ -587,6 +649,7 @@ function createApp() {
       this._forceRedraw = false
       this._gridWindowCommit = false
     }
+    this.scheduleStageMounts()
     return true
   },
   async ensureWindow({ reset = false, reload = false } = {}) {
@@ -638,13 +701,25 @@ function createApp() {
             if (!boot) break
           }
 
-          // ---- Full-load path (≤500 rows): paint everything; native scroll ----
-          // Re-fetch on reload (delete/duplicate/blank/etc). Scroll alone never re-fetches.
+          // Stable pagination replaces virtual-window scrolling for the grid.
+          if (this.usePagination) {
+            if (doReset) this.page = 0
+            const maxPage = Math.max(0, Math.ceil((this.total || 0) / this.pageSize) - 1)
+            this.page = Math.max(0, Math.min(this.page, maxPage))
+            this.savePaginationPrefs()
+            const first = this.page * this.pageSize
+            const data = await this._fetchEntities(first, this.pageSize)
+            if (!data) break
+            this._fullLoaded = false
+            this._commitWindow(first, data.rows, { force: true })
+            break
+          }
+
+          // ---- Full-load path (small sheets): paint everything; native scroll ----
           if (this._canFullLoad() || (doReload && this._fullLoaded)) {
             if (!this._fullLoaded || doReload) {
               const data = await this._fetchEntities(0, Math.max(this.total || 1, 1))
               if (!data) break
-              // total may have grown past full-load — only then leave natural mode.
               if (data.total > V_FULL_LOAD_MAX) {
                 this._fullLoaded = false
                 this._ensureQueued = true
@@ -657,42 +732,24 @@ function createApp() {
           }
           this._fullLoaded = false
 
-          // ---- Virtual path (total > 500): direct range fetch, no page cache ----
+          // ---- Windowed path: rows keep natural height; ROWH estimates spacers ----
           let { first, count, visibleFirst, visibleLast } = this._visibleRange()
+          if (!doReload && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) break
+          if (!doReload && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) break
 
-          if (!doReload && this._isGridScrollHot() && this._windowCoversView(visibleFirst, visibleLast)) {
-            break
-          }
-          if (!doReload && this._totalKnown && this._windowCoversView(visibleFirst, visibleLast)) {
-            break
-          }
-
-          // Cap request to server max.
-          if (count > V_FULL_LOAD_MAX) count = V_FULL_LOAD_MAX
+          count = Math.min(count, V_FULL_LOAD_MAX)
           const data = await this._fetchEntities(first, Math.max(count, 1))
           if (!data) break
 
-          // Scroll may have moved during await.
-          ;({ first, count, visibleFirst, visibleLast } = this._visibleRange())
+          ;({ first, count } = this._visibleRange())
           if (this._totalKnown) count = Math.min(count, Math.max(0, this.total - first), V_FULL_LOAD_MAX)
-
-          // If the response offset still matches what we need, use it; else re-fetch once.
-          let assembled
-          if (data.offset === first && data.rows.length >= Math.min(count, data.rows.length)) {
-            assembled = count < data.rows.length ? data.rows.slice(0, count) : data.rows
-            // If we asked for more than returned but total says more exist, clamp.
-            if (this.total > 0 && first + assembled.length > this.total) {
-              assembled = assembled.slice(0, Math.max(0, this.total - first))
-            }
-          } else {
+          let assembled = data.offset === first ? data.rows : null
+          if (!assembled) {
             const again = await this._fetchEntities(first, Math.max(count, 1))
             if (!again) break
             assembled = again.rows
           }
-
-          if (assembled) {
-            this._commitWindow(first, assembled, { force: doReload || doReset })
-          }
+          this._commitWindow(first, assembled.slice(0, count), { force: doReload || doReset })
         } while (this._ensureQueued || this._scrollDirty)
       } finally {
         this._ensureRunning = false
@@ -705,6 +762,38 @@ function createApp() {
   async refreshWindow(reset) {
     if (reset) await this.ensureWindow({ reset: true })
     else await this.ensureWindow({ reload: true })
+  },
+  resetGridScrollTop() {
+    const el = document.querySelector('.gridwrap')
+    if (el) {
+      this._programmaticGridScroll = true
+      try { el.scrollTop = 0 } finally { this._programmaticGridScroll = false }
+    }
+    this._scrollTop = 0
+    this._scrollVel = 0
+    this._lastScrollTop = 0
+  },
+  setPage(nextPage) {
+    const page = Math.max(0, Math.min(Number(nextPage) || 0, this.pageCount - 1))
+    if (page === this.page) return
+    this.page = page
+    this.savePaginationPrefs()
+    this.resetGridScrollTop()
+    this.refreshWindow(false)
+  },
+  jumpToPage(value) {
+    const pageNumber = Math.round(Number(value))
+    if (!Number.isFinite(pageNumber)) return
+    this.setPage(pageNumber - 1)
+  },
+  setPageSize(value) {
+    const next = Math.max(1, Math.min(100, Number(value) || 10))
+    if (next === this.pageSize) return
+    this.pageSize = next
+    this.page = 0
+    this.savePaginationPrefs()
+    this.resetGridScrollTop()
+    this.refreshWindow(false)
   },
   onScroll(e) {
     // Ignore only our own programmatic restores (setting scrollTop after M.redraw).
@@ -724,6 +813,10 @@ function createApp() {
     this._gridUserScrollAt = now
     this._scheduleScrollIdleFlush()
 
+    // Pagination still needs this snapshot for redraw restoration; it simply
+    // does not need virtual-window fetching below.
+    if (this.usePagination) return
+
     // Full-load sheets: native scroll only — never ensureWindow/redraw on scroll.
     if (this._fullLoaded && this._canFullLoad()) return
 
@@ -742,8 +835,9 @@ function createApp() {
   },
   // Spacers: total height = totalBodyH stays fixed while top/bot pads rebalance.
   // Full-load natural rows: winStart=0 and rows.length===total → pads are 0; native height wins.
-  get topPad() { return this.winStart * ROWH },
+  get topPad() { return this.usePagination ? 0 : this.winStart * ROWH },
   get bottomPad() {
+    if (this.usePagination) return 0
     const totalH = this.totalBodyH || ((this.total || 0) * ROWH)
     return Math.max(0, totalH - this.topPad - this.rows.length * ROWH)
   },
@@ -751,9 +845,9 @@ function createApp() {
     // GPU layer promotion (GROK1 #3). Geometry comes from top/bot spacers, not translate Y.
     return 'translate3d(0,0,0)'
   },
-  // Natural variable heights when full-loaded; fixed ROWH only while virtualizing.
+  // Natural variable height is never contingent on total entity count.
   get rowHeightMode() {
-    return (this._fullLoaded && this._canFullLoad()) ? 'rows-natural' : 'rows-fixed'
+    return 'rows-natural'
   },
 
   // ---- cell rendering (Γ, §4.1 default widgets) ----
@@ -768,8 +862,9 @@ function createApp() {
   },
   async _importStageViews(slug, hash) {
     // Real URL import: the browser resolves the module's own `../lib/*.mjs`
-    // relatives against /stagemod/stages/, and caches per version hash.
-    const url = `/stagemod/stages/${encodeURIComponent(slug)}.mjs?v=${hash}`
+    // relatives against /stagemod/stages/. The stage endpoint stamps its lib
+    // imports with mtimes, so use a fresh stage URL to pick up changed libs too.
+    const url = `/stagemod/stages/${encodeURIComponent(slug)}.mjs?v=${hash}&load=${Date.now()}`
     return await import(/* webpackIgnore: true */ url)
   },
   _hashStr(s) {
@@ -799,16 +894,13 @@ function createApp() {
       .then(async (code) => {
         if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
         const hash = this._hashStr(code)
-        // Same source as last successful load — keep module, skip import + redraw.
-        if (force && hadPrevious && prevHash === hash) {
-          this._viewSourceHash[slug] = hash
-          return this.viewMods[slug]
-        }
+        // A forced reload may be caused by a changed browser-safe lib. The
+        // stage Coffee source hash can be identical in that case, so re-import.
         const m = await this._importStageViews(slug, hash)
         if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
         this.viewMods[slug] = m
         this._viewSourceHash[slug] = hash
-        return { mod: m, changed: !hadPrevious || prevHash !== hash }
+        return { mod: m, changed: force || !hadPrevious || prevHash !== hash }
       })
       .then((result) => {
         if (this._viewGen[slug] !== gen) return this.viewMods[slug] ?? null
@@ -839,7 +931,14 @@ function createApp() {
     this._viewRedrawPending = true
     requestAnimationFrame(() => {
       this._viewRedrawPending = false
-      this.redrawGrid()
+      const force = this._forceNextViewRedraw === true
+      this._forceNextViewRedraw = false
+      if (force) {
+        M.redraw({ force: true })
+        this.scheduleStageMounts()
+      } else {
+        this.redrawGrid()
+      }
     })
   },
   // Coalesce bursty signals (tool_result + stages_updated + WS) into one trailing reload.
@@ -865,7 +964,7 @@ function createApp() {
       this.ensureView(col.stage)
       const mod = this.viewMods[col.stage]
       if (mod?.views?.cell) {
-        try { return mod.views.cell(row.doc)?.template ?? '' } catch (e) { return `<span class="cellstate">⚠ ${esc(e.message)}</span>` }
+        try { return mod.views.cell(row.doc, { entityId: row.id })?.template ?? '' } catch (e) { return `<span class="cellstate">⚠ ${esc(e.message)}</span>` }
       }
       const writes = mod?.meta?.writes?.[0]
       return writes ? this.widget(getPath(row.doc, writes), `${row.id}|${ci}`) : ''
@@ -874,19 +973,32 @@ function createApp() {
     return ''
   },
   stageCellKey(rowId, stage) { return `${rowId}|${stage}` },
-  scheduleStageMounts() {
+  scheduleStageMounts({ retry = true } = {}) {
     if (this._stageMountRaf) return
     this._stageMountRaf = requestAnimationFrame(() => {
       this._stageMountRaf = 0
       this.syncStageMounts()
+      // A throttled root redraw can leave this pass ahead of fresh cell DOM.
+      // Retry once after the MJS throttle window so interactive views mount.
+      if (retry && !this._stageMountRetryTimer) {
+        this._stageMountRetryTimer = setTimeout(() => {
+          this._stageMountRetryTimer = null
+          this.scheduleStageMounts({ retry: false })
+        }, 550)
+      }
     })
   },
   /** After paint: call optional views.mount(el, ctx) on stage cells; unmount stale ones. */
   syncStageMounts() {
     if (!this._stageMounts) this._stageMounts = new Map()
     const seen = new Set()
+    const viewport = document.querySelector('.gridwrap')?.getBoundingClientRect()
+    const top = (viewport?.top ?? 0) - 320
+    const bottom = (viewport?.bottom ?? window.innerHeight) + 320
     const tds = document.querySelectorAll('td[data-r][data-c] .cell-inner')
     for (const inner of tds) {
+      const rect = inner.getBoundingClientRect()
+      if (rect.bottom < top || rect.top > bottom) continue
       const td = inner.closest('td[data-r][data-c]')
       if (!td) continue
       const i = Number(td.dataset.r)
@@ -940,15 +1052,45 @@ function createApp() {
       rowIndex: absR,
       canPersist: () => app.canPersist(),
       patchEntity: (patch) => app.patchEntity(entityId, patch),
-      setStageEditing: (on) => {
-        if (on) app.stageEditing = { stage, id: entityId, r: absR, ci }
-        else if (app.stageEditing?.id === entityId && app.stageEditing?.stage === stage) app.stageEditing = null
+      rpc: (method, args = null) => app.callStageRpc(entityId, stage, method, args),
+      openEditor: (editor) => {
+        app.stageEditing = { stage, id: entityId, r: absR, ci }
+        app.openStageEditor({ ...editor, entityId, columnIndex: ci })
+      },
+      closeEditor: () => {
+        if (app.stageEditing?.id === entityId && app.stageEditing?.stage === stage) app.stageEditing = null
+        app.closeStageEditor()
+      },
+      setStageEditing: (on, draft = null) => {
+        if (on) {
+          app.stageEditing = {
+            stage, id: entityId, r: absR, ci,
+            draft: draft ?? (app.stageEditing?.id === entityId && app.stageEditing?.stage === stage ? app.stageEditing.draft : ''),
+          }
+        } else if (app.stageEditing?.id === entityId && app.stageEditing?.stage === stage) {
+          app.stageEditing = null
+        }
         // Do not full-redraw while focusing an input — just track state.
       },
       isStageEditing: () => app.stageEditing?.id === entityId && app.stageEditing?.stage === stage,
+      getStageEditDraft: () => app.stageEditing?.id === entityId && app.stageEditing?.stage === stage ? app.stageEditing.draft : null,
       showToast: (msg) => app.showToast(msg),
       redraw: () => { M.redraw(); app.scheduleStageMounts() },
     }
+  },
+  openStageEditor(editor) {
+    if (!editor?.key || !editor?.component) return
+    this.stageEditor = editor
+    M.redraw({ force: true })
+  },
+  isStageEditorCell(row, ci) {
+    return this.stageEditor?.entityId === row?.id && this.stageEditor?.columnIndex === ci
+  },
+  closeStageEditor() {
+    const key = this.stageEditor?.key
+    this.stageEditor = null
+    if (key) M.unmountComponent?.(key)
+    M.redraw({ force: true })
   },
   /** Generic entity patch: { component: { fieldOrNestedPath: value } } via PATCH API. */
   async patchEntity(id, patch) {
@@ -957,27 +1099,14 @@ function createApp() {
       return null
     }
     if (!id || !patch || typeof patch !== 'object') return null
-    // Expand multi-component patch into sequential field writes (server is one field per call).
-    const ops = []
-    for (const [component, fields] of Object.entries(patch)) {
-      if (fields != null && typeof fields === 'object' && !Array.isArray(fields)) {
-        for (const [field, value] of Object.entries(fields)) ops.push({ component, field, value })
-      } else {
-        ops.push({ component, field: '', value: fields })
-      }
-    }
-    if (!ops.length) return null
-    let doc = null
     try {
-      for (const op of ops) {
-        const response = await fetch(`/api/entity/${encodeURIComponent(id)}?activity=${this.actSlug}`, {
-          method: 'PATCH', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(op),
-        })
-        const result = await response.json()
-        if (!response.ok || !result.ok) throw new Error(result.error ?? `save failed (${response.status})`)
-        doc = result.doc
-      }
+      const response = await fetch(`/api/entity/${encodeURIComponent(id)}?activity=${this.actSlug}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ patch }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.ok) throw new Error(result.error ?? `save failed (${response.status})`)
+      const doc = result.doc
       if (doc) {
         this.rows = this.rows.map((row) => row.id === id ? { ...row, doc } : row)
         M.redraw()
@@ -986,6 +1115,29 @@ function createApp() {
       return doc
     } catch (error) {
       this.showToast(error.message ?? 'save failed')
+      return null
+    }
+  },
+  async callStageRpc(id, stage, method, args = null) {
+    if (!this.canPersist()) {
+      this.showToast('desynced — cannot run RPC')
+      return null
+    }
+    try {
+      const response = await fetch('/api/rpc', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ activity: this.actSlug, id, stage, method, args }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.ok) throw new Error(result.error ?? `RPC failed (${response.status})`)
+      if (result.doc) {
+        this.rows = this.rows.map((row) => row.id === id ? { ...row, doc: result.doc } : row)
+        this.redrawGrid()
+      }
+      this.showToast(result.message ?? `${stage}: ${method} complete`)
+      return result
+    } catch (error) {
+      this.showToast(error.message ?? 'RPC failed')
       return null
     }
   },
@@ -1194,7 +1346,18 @@ function createApp() {
     const h = this.rowHeights[row.id]
     return h == null ? null : normalizeRowHeight(h)
   },
+  isRowCollapsed(row) { return !!row?.id && this.collapsedRowIds[row.id] === true },
+  toggleRowCollapsed(row) {
+    if (!row?.id) return
+    const next = { ...this.collapsedRowIds }
+    if (next[row.id]) delete next[row.id]
+    else next[row.id] = true
+    this.collapsedRowIds = next
+    this.saveCollapsedRows()
+    this.redrawGrid()
+  },
   rowStyle(row) {
+    if (this.isRowCollapsed(row)) return `--row-h:${ROWH}px;height:${ROWH}px`
     const h = this.rowHeightPx(row)
     if (h != null) return `--row-h:${h}px;height:${h}px`
     // Virtual window needs a fixed height so spacers stay accurate.
@@ -1202,6 +1365,7 @@ function createApp() {
     return ''
   },
   rowClass(row) {
+    if (this.isRowCollapsed(row)) return 'row-h-fixed row-collapsed'
     if (this.rowHeightPx(row) != null) return 'row-h-fixed'
     if (this.rowHeightMode === 'rows-fixed') return 'row-h-fixed'
     return ''
@@ -1315,6 +1479,21 @@ function createApp() {
   colSelected(ci) { return this.sel.ranges.some((g) => ci >= g.c0 && ci <= g.c1) },
   isActive(i, ci) { const a = this.sel.active; return a && a.r === this.absRow(i) && a.c === ci },
   globalKey(e) {
+    // Ctrl/Cmd+G always runs the selected cells, even when a stage editor is
+    // open or another editor has focus; it must not be swallowed by any guard.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'g') {
+      e.preventDefault()
+      void this.play()
+      return
+    }
+    // The root-owned stage editor is authoritative: its first Escape closes
+    // edit mode, and only a subsequent Escape may clear the sheet selection.
+    if (e.key === 'Escape' && this.stageEditor) {
+      e.preventDefault()
+      e.stopImmediatePropagation()
+      this.closeStageEditor()
+      return
+    }
     if (this.editing || this.focus) return
     // Stage-owned inputs keep focus; Escape still cancels stage edit via onKey when possible.
     const tag = e.target?.tagName
@@ -1336,14 +1515,14 @@ function createApp() {
       this.clearSelection()
       return
     }
-    // Shift+F5 → same as the Play toolbar button (run selection).
-    // preventDefault so the browser does not hard-refresh (common Shift+F5 binding).
-    if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'F5' || e.code === 'F5')) {
+    const a = this.sel.active
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'e') {
+      const row = a ? this.rows[a.r - this.winStart] : null
+      if (!row) return
       e.preventDefault()
-      void this.play()
+      this.toggleRowCollapsed(row)
       return
     }
-    const a = this.sel.active
     const lastR = Math.max(0, (this.total || 1) - 1)
     const lastC = Math.max(0, this.columns.length - 1)
     const moveSelTo = (r, c, { shift } = {}) => {
@@ -1601,7 +1780,16 @@ function createApp() {
     const col = this.columns[ci]
     if (!col) return ''
     if (col.field) return this.clipboardValue(getPath(row.doc, col.field))
-    if (col.stage) return this.clipboardValue(getPath(row.doc, await this.stageWritePath(col.stage)))
+    if (col.stage) {
+      const mod = this.viewMods[col.stage] ?? await this.ensureView(col.stage)
+      if (typeof mod?.views?.copy === 'function') {
+        try { return this.clipboardValue(await mod.views.copy(row.doc)) } catch { /* use display/persisted fallback */ }
+      }
+      if (typeof mod?.views?.text === 'function') {
+        try { return this.clipboardValue(await mod.views.text(row.doc)) } catch { /* use persisted fallback */ }
+      }
+      return this.clipboardValue(getPath(row.doc, await this.stageWritePath(col.stage)))
+    }
     return ''
   },
   async copySelection() {
@@ -1795,7 +1983,10 @@ function createApp() {
     }
     const l = document.querySelector('.logbox')
     if (l) {
-      const userScrolledSince = (this._logUserScrollAt ?? 0) > snap.logUserAt
+        if (this._fullLoaded && this._canFullLoad()) {
+          this.scheduleStageMounts()
+          return
+        }
       if (snap.logPinned && this.logPinned) {
         this._logProgrammaticScroll = true
         l.scrollTop = l.scrollHeight
@@ -1999,7 +2190,9 @@ function createApp() {
     } catch {
       this.filterValues = { ci, loading: false, items: [], sampled: 0, distinct: 0 }
     }
-    M.redraw()
+    // The facet response often lands inside the normal redraw cooldown after
+    // opening the menu. Force this one completion paint so Top values appears.
+    M.redraw({ force: true })
   },
   valuePct(item) {
     const sampled = this.filterValues?.sampled ?? 0
@@ -2498,6 +2691,7 @@ function createApp() {
     this.actSlug = slug
     this.tabMenu = null
     this.filterMenu = null
+    this.loadPaginationPrefs()
     this.restoreColFilters()
     location.hash = `#/a/${slug}`
     await this.refreshWindow(true)
@@ -2746,6 +2940,7 @@ function createApp() {
     if (!response.ok || !result.ok) return this.showToast(result.error ?? 'could not clear queue')
     this.cellStates = {}
     this.stagePending = {}
+    this.logs = []
     M.redraw()
     this.showToast('queue cleared')
   },
@@ -2756,13 +2951,31 @@ function createApp() {
     if (!response.ok || !result.ok) return this.showToast(result.error ?? 'could not pause queue')
     this.showToast('queue paused')
   },
+  async setConcurrency(value, { force = false } = {}) {
+    const n = Math.max(0, Math.min(64, Math.round(Number(value) || 0)))
+    if (!force && n === this.conc) return
+    const previous = this.conc
+    this.conc = n
+    M.redraw()
+    try {
+      const response = await fetch('/api/queue/concurrency', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ n }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.ok) throw new Error(result.error ?? 'could not update concurrency')
+    } catch (error) {
+      this.conc = previous
+      M.redraw()
+      this.showToast(error.message ?? 'could not update concurrency')
+    }
+  },
   sliderDown(e) {
     this.dragging = { x: e.clientX, v: this.conc }
     const move = (ev) => { if (this.dragging) { this.conc = Math.max(0, Math.min(64, Math.round(this.dragging.v + (ev.clientX - this.dragging.x) / 3))); M.redraw() } }
     const up = async () => {
       window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up)
       const n = this.conc; this.dragging = null
-      await fetch('/api/queue/concurrency', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ n }) })
+      await this.setConcurrency(n, { force: true })
     }
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up)
   },
@@ -3285,7 +3498,7 @@ function createApp() {
   <div class="layout">
     <div class="main">
       <div class="toolbar">
-        <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : (wsConnecting ? 'connecting' : ''))" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : (wsConnecting ? 'connecting to sheets server' : 'disconnected from sheets server'))" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span><button class="refresh-button" @click="refreshPersistent()" title="reload persistent files">↻</button>
+        <span class="dot" :class="desynced ? 'desync' : (wsConnected ? 'on' : (wsConnecting ? 'connecting' : ''))" :title="desynced ? 'desynchronized: reload persistent files before saving' : (wsConnected ? 'connected to sheets server' : (wsConnecting ? 'connecting to sheets server' : 'disconnected from sheets server'))" x-text="desynced ? '!' : ''"></span><span class="desync-label" x-show="desynced">desync</span><span class="title">sheets</span>
         <span x-text="meta ? meta.root.split('/').pop() : ''" style="color:var(--dim)"></span>
         <div class="dropdown" @click.outside="fieldMenu = false">
           <button class="toolbar-icon-btn toolbar-dropdown-btn" @click="toggleFieldMenu()" title="columns">
@@ -3388,9 +3601,23 @@ function createApp() {
             <i class="ph-bold ph-x" aria-hidden="true"></i>
           </button>
         </div>
+        <div class="page-controls" title="spreadsheet row pagination">
+          <button class="toolbar-icon-btn" @click="setPage(page - 1)" :disabled="page <= 0" title="previous page"><i class="ph-bold ph-caret-left" aria-hidden="true"></i></button>
+          <label class="page-number" title="type a page number">
+            <input id="sheets-page-jump" type="text" inputmode="numeric" pattern="[0-9]*" :value="page + 1"
+              @change="jumpToPage($event.target.value)"
+              @keydown="if ($event.key === 'Enter') { $event.preventDefault(); jumpToPage($event.target.value); $event.target.blur() }">
+            <span x-text="'/ ' + pageCount"></span>
+          </label>
+          <button class="toolbar-icon-btn" @click="setPage(page + 1)" :disabled="page >= pageCount - 1" title="next page"><i class="ph-bold ph-caret-right" aria-hidden="true"></i></button>
+          <select class="page-size" :value="pageSize" @change="setPageSize($event.target.value)" title="rows per page">
+            <option value="5">5</option><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option>
+          </select>
+        </div>
+        <span class="refresh-monitor" :title="'MJS refresh requests: ' + refreshCount + ' · throttled: ' + throttledRefreshCount" x-text="'refresh ' + refreshCount"></span>
         <div class="toolbar-end">
           <span class="play-summary" x-text="playSummaryLabel"></span>
-          <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection (Shift+F5)">
+          <button class="toolbar-icon-btn play-btn" @click="play()" title="run selection (Ctrl/Cmd+G)">
             <i class="ph-bold ph-play" aria-hidden="true"></i>
           </button>
         </div>
@@ -3423,7 +3650,6 @@ function createApp() {
           </div>
         </div>
       </div>
-
       <div class="gridwrap" x-show="!focus" @scroll="onScroll($event)" @mouseup="cellUp()" @mousedown="gridVoidDown($event)">
         <table class="grid" :class="(colResize ? 'col-resizing ' : '') + (rowResize ? 'row-resizing' : '')">
           <thead>
@@ -3559,15 +3785,20 @@ function createApp() {
                     :title="'copy path: ' + (row.file || row.id)">
                     <i class="ph-bold ph-copy" aria-hidden="true"></i>
                   </button>
+                  <button class="row-collapse" type="button" x-show="row.id" @click.stop="toggleRowCollapsed(row)"
+                    :title="isRowCollapsed(row) ? 'expand row' : 'collapse row'">
+                    <i :class="isRowCollapsed(row) ? 'ph-bold ph-caret-down' : 'ph-bold ph-caret-up'" aria-hidden="true"></i>
+                  </button>
                 </span>
                 <div class="row-resize" :class="rowResize && rowResize.id === row.id ? 'active' : ''"
                   title="drag to resize row" @pointerdown="startRowResize(i, $event)"></div>
               </td>
               <td x-for="col, ci in columns" :key="col.stage || col.field || 'empty-' + ci" :data-r="i" :data-c="ci" :style="colStyle(ci)"
-                :class="(inSel(i, ci) ? 'sel ' : '') + (isActive(i, ci) ? 'active ' : '') + cellStateClass(row, ci)"
+                :class="(inSel(i, ci) ? 'sel ' : '') + (isActive(i, ci) ? 'active ' : '') + cellStateClass(row, ci) + (isStageEditorCell(row, ci) ? 'stage-editor-cell ' : '')"
                 @mousedown="cellDown(i, ci, $event)" @mouseover="cellOver(i, ci, $event)"
                 @dblclick="cellDbl(i, ci)">
-                <div class="cell-inner" x-html="cellHtml(row, ci)"></div>
+                <template x-if="isStageEditorCell(row, ci)"><div x-mount="stageEditor && stageEditor.component"></div></template>
+                <template x-if="!isStageEditorCell(row, ci)"><div class="cell-inner" x-html="cellHtml(row, ci)"></div></template>
               </td>
             </tr>
             <tr class="virtual-spacer virtual-spacer-bot" aria-hidden="true">
@@ -3619,10 +3850,16 @@ function createApp() {
             <i class="ph-bold ph-chat-teardrop-dots" aria-hidden="true"></i>
           </span>
           <button class="queue-pause" x-show="q.running > 0" @click="pauseQueue()" title="pause queue">Ⅱ</button>
+          <button class="queue-concurrency-step" type="button" @click="setConcurrency(conc - 1)" :disabled="conc <= 0" title="decrease concurrency">
+            <i class="ph-bold ph-minus-circle" aria-hidden="true"></i>
+          </button>
           <div class="slider" title="concurrency" @pointerdown="sliderDown($event)">
             <div class="fill" :style="'width:' + Math.max(2, conc / 64 * 100) + '%'"></div>
             <div class="val" x-text="conc"></div>
           </div>
+          <button class="queue-concurrency-step" type="button" @click="setConcurrency(conc + 1)" :disabled="conc >= 64" title="increase concurrency">
+            <i class="ph-bold ph-plus-circle" aria-hidden="true"></i>
+          </button>
         </div>
       </div>
       <div class="loghead">
@@ -3749,22 +3986,54 @@ function patchApp(existing, next) {
   return existing
 }
 
+function bindGlobalPlayShortcut() {
+  if (window.__SHEETS_SHIFT_F5_HANDLER__) {
+    window.removeEventListener('keydown', window.__SHEETS_SHIFT_F5_HANDLER__, true)
+    delete window.__SHEETS_SHIFT_F5_HANDLER__
+  }
+  if (window.__SHEETS_PLAY_SHORTCUT_HANDLER__) {
+    window.removeEventListener('keydown', window.__SHEETS_PLAY_SHORTCUT_HANDLER__, true)
+  }
+  const handler = (event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey) return
+    if (event.key.toLowerCase() !== 'g') return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    void M.root?.play()
+  }
+  window.__SHEETS_PLAY_SHORTCUT_HANDLER__ = handler
+  window.addEventListener('keydown', handler, true)
+}
+
 async function boot(bust = 0) {
   const next = createApp()
   if (!window.__SHEETS_MOUNTED__) {
     window.__SHEETS_MOUNTED__ = true
     M.mount('#app', () => next)
+    bindGlobalPlayShortcut()
     console.info('[sheets] mounted')
     return
   }
   const root = M.root
   if (!root) {
     M.mount('#app', () => next)
+    bindGlobalPlayShortcut()
     console.info('[sheets] remounted', bust)
     return
   }
   patchApp(root, next)
-  M.redraw()
+  bindGlobalPlayShortcut()
+  if (bust) {
+    // A lib-only HMR update leaves the stage Coffee source hash unchanged.
+    // Drop browser view-module caches so recycled virtual rows cannot mix old
+    // and new renderers after a views.mjs edit.
+    root.viewMods = {}
+    root.viewLoading = {}
+    root._viewPromises = {}
+    root._viewSourceHash = {}
+    root._forceNextViewRedraw = true
+  }
+  M.redraw({ force: bust !== 0 })
   console.info('[sheets] hot reloaded', bust)
 }
 
