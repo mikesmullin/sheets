@@ -1,0 +1,13 @@
+components:
+  produce:
+    fields:
+      name:
+        type: string
+  appearance:
+    fields:
+      color:
+        type: string
+  animal:
+    fields:
+      name:
+        type: string

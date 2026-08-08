@@ -1,0 +1,9 @@
+produce:
+  name: strawberry
+appearance:
+  color: '#e53935'
+animal:
+  name: Eastern cottontail
+  noise: The cottontail produces rapid, wet 'snip-crunch' sounds as its nimble teeth
+    shear through the ruby-red skin, followed by soft, rhythmic smacking of its whiskers
+    against the pulpy fruit.

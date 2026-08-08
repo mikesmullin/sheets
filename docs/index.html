@@ -1,0 +1,1506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stage Developer Contract — sheets</title>
+<style>
+  :root{
+    /* charcoal base */
+    --bg:#0b0b0c;
+    --bg-soft:#0f0f11;
+    --panel:#141416;
+    --panel-2:#191a1d;
+    --panel-3:#1f2023;
+    --code:#08080a;
+    --line:#242427;
+    --line-2:#2f3034;
+
+    /* ink */
+    --text:#eae7e2;
+    --dim:#a5a19a;
+    --muted:#78746d;
+    --faint:#565350;
+
+    /* ember */
+    --o:#ff7a1a;
+    --o-2:#ffa451;
+    --o-3:#ffcd9b;
+    --o-glow:rgba(255,122,26,.14);
+    --o-line:rgba(255,122,26,.35);
+
+    --amber:#f5a623;
+    --rust:#e5484d;
+    --moss:#63b37b;
+
+    --r:14px; --r-sm:10px; --r-xs:7px;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.65 var(--sans);
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 420px at 12% -8%, rgba(255,122,26,.10), transparent 62%),
+      radial-gradient(700px 380px at 92% -12%, rgba(255,122,26,.05), transparent 60%);
+    background-attachment:fixed;
+  }
+  a{color:var(--o-2);text-decoration:none}
+  a:hover{color:var(--o-3);text-decoration:underline;text-underline-offset:3px}
+  h1,h2,h3{letter-spacing:-.01em}
+  code{font-family:var(--mono);font-size:.86em}
+  pre{margin:0;overflow:auto}
+  ::selection{background:rgba(255,122,26,.28)}
+
+  /* ── scrollbars ─────────────────────────── */
+  *::-webkit-scrollbar{height:10px;width:10px}
+  *::-webkit-scrollbar-track{background:transparent}
+  *::-webkit-scrollbar-thumb{background:#2b2c30;border-radius:99px;border:2px solid transparent;background-clip:content-box}
+  *::-webkit-scrollbar-thumb:hover{background:#3d3e44;background-clip:content-box}
+
+  /* ── top bar ────────────────────────────── */
+  .topbar{
+    position:sticky;top:0;z-index:60;
+    backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    background:rgba(11,11,12,.78);border-bottom:1px solid var(--line);
+  }
+  .topbar .in{max-width:1180px;margin:0 auto;padding:11px 22px;display:flex;align-items:center;gap:14px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:14px;letter-spacing:-.01em}
+  .brand .ghost{font-size:17px;filter:drop-shadow(0 0 10px rgba(255,122,26,.45))}
+  .brand b{color:var(--o)}
+  .crumb{color:var(--muted);font:11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
+  .crumb::before{content:"/";margin-right:12px;color:var(--faint)}
+  .topbar .spacer{flex:1}
+  .tag{
+    font:10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+    color:var(--o-2);border:1px solid var(--o-line);background:var(--o-glow);
+    padding:6px 9px;border-radius:999px;white-space:nowrap;
+  }
+  .progress{position:absolute;left:0;bottom:-1px;height:2px;width:0;
+    background:linear-gradient(90deg,var(--o),var(--o-2));box-shadow:0 0 12px rgba(255,122,26,.7)}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:30px 22px 90px}
+
+  /* ── hero ───────────────────────────────── */
+  .hero{
+    position:relative;overflow:hidden;border:1px solid var(--line);border-radius:20px;
+    background:
+      linear-gradient(160deg,rgba(255,122,26,.13),transparent 46%),
+      linear-gradient(180deg,var(--panel-2),var(--panel));
+    padding:34px 34px 28px;
+  }
+  .hero::before{ /* hairline */
+    content:"";position:absolute;inset:0;border-radius:20px;pointer-events:none;
+    background:linear-gradient(180deg,rgba(255,255,255,.07),transparent 30%);
+    -webkit-mask:linear-gradient(#000,#000) content-box,linear-gradient(#000,#000);
+    -webkit-mask-composite:xor;mask-composite:exclude;padding:1px;
+  }
+  .hero::after{ /* watermark */
+    content:"👻";position:absolute;right:-14px;top:-46px;font-size:220px;line-height:1;
+    opacity:.05;transform:rotate(9deg);pointer-events:none;user-select:none;
+  }
+  .kicker{
+    font:10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+    color:var(--o);display:flex;align-items:center;gap:9px;margin-bottom:14px;
+  }
+  .kicker::after{content:"";flex:1;height:1px;max-width:80px;
+    background:linear-gradient(90deg,var(--o-line),transparent)}
+  .hero h1{
+    margin:0;font-size:clamp(30px,4.6vw,46px);line-height:1.05;font-weight:700;
+    background:linear-gradient(96deg,#fff 18%,var(--o-3) 58%,var(--o) 96%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .hero .lede{margin:14px 0 0;color:var(--dim);max-width:70ch;font-size:15.5px}
+  .hero .lede code{color:var(--o-3)}
+
+  /* ── layout ─────────────────────────────── */
+  .grid{display:grid;grid-template-columns:250px minmax(0,1fr);gap:26px;margin-top:26px;align-items:start}
+  @media(max-width:980px){.grid{grid-template-columns:1fr}}
+
+  /* ── toc ────────────────────────────────── */
+  .toc{position:sticky;top:66px;max-height:calc(100vh - 90px);overflow:auto;
+    border:1px solid var(--line);background:var(--panel);border-radius:var(--r);padding:14px 10px}
+  @media(max-width:980px){.toc{position:static;max-height:none}}
+  .toc h3{margin:0 0 10px;padding:0 8px;font:10px/1 var(--mono);letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted)}
+  .toc a{
+    display:flex;gap:9px;align-items:baseline;padding:6px 9px;border-radius:var(--r-xs);
+    color:var(--dim);font-size:13px;border-left:2px solid transparent;
+  }
+  .toc a .n{font:10px/1 var(--mono);color:var(--faint);min-width:17px;flex:none}
+  .toc a:hover{background:var(--panel-2);color:var(--text);text-decoration:none}
+  .toc a.active{background:var(--o-glow);color:var(--o-3);border-left-color:var(--o)}
+  .toc a.active .n{color:var(--o)}
+  .toc .sep{height:1px;background:var(--line);margin:10px 8px}
+
+  /* ── cards / sections ───────────────────── */
+  main{display:flex;flex-direction:column;gap:16px;min-width:0}
+  .card{
+    position:relative;border:1px solid var(--line);background:var(--panel);
+    border-radius:var(--r);padding:22px 24px;scroll-margin-top:74px;
+  }
+  .card > .num{
+    position:absolute;left:0;top:24px;width:3px;height:26px;border-radius:0 3px 3px 0;
+    background:linear-gradient(180deg,var(--o),rgba(255,122,26,0));
+  }
+  .sec-head{display:flex;align-items:center;gap:11px;flex-wrap:wrap;margin-bottom:6px}
+  .sec-no{
+    font:10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;color:var(--o);
+    border:1px solid var(--o-line);background:var(--o-glow);padding:5px 8px;border-radius:6px;
+  }
+  .sec-tag{font:10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;color:var(--muted)}
+  .card h2{margin:2px 0 10px;font-size:21px;font-weight:650}
+  .card h3{margin:0 0 8px;font-size:13.5px;color:var(--o-3);font-weight:650;
+    letter-spacing:.02em;text-transform:uppercase;font-family:var(--mono)}
+  .lead{color:var(--dim);margin:0 0 14px}
+  .lead:last-child{margin-bottom:0}
+
+  /* ── callouts ───────────────────────────── */
+  .callout{
+    border:1px solid var(--line-2);background:var(--panel-2);border-radius:var(--r-sm);
+    padding:12px 14px;color:var(--dim);font-size:13.5px;
+    border-left:2px solid var(--line-2);
+  }
+  .callout strong{color:var(--text)}
+  .callout code{color:var(--o-3)}
+  .callout.warn{border-color:rgba(245,166,35,.28);border-left-color:var(--amber);
+    background:rgba(245,166,35,.06)}
+  .callout.warn strong{color:#ffd489}
+  .callout.err{border-color:rgba(229,72,77,.3);border-left-color:var(--rust);
+    background:rgba(229,72,77,.06)}
+  .callout.tip{border-color:var(--o-line);border-left-color:var(--o);background:var(--o-glow)}
+  .callout.tip strong{color:var(--o-3)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:900px){.cols{grid-template-columns:1fr}}
+  .stack{display:flex;flex-direction:column;gap:10px}
+
+  /* ── tables ─────────────────────────────── */
+  .tbl{border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{padding:10px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  thead th{background:var(--panel-3);font:10px/1.4 var(--mono);letter-spacing:.12em;
+    text-transform:uppercase;color:var(--o-2)}
+  tbody th,table > tr > th{background:var(--panel-2);color:var(--o-3);font-weight:600;
+    font-size:12.5px;white-space:nowrap;width:1%;font-family:var(--mono);letter-spacing:.01em}
+  td{color:var(--dim)}
+  td code,th code{color:var(--o-3)}
+  tr:last-child td,tr:last-child th{border-bottom:0}
+  tbody tr:hover td{background:rgba(255,255,255,.018)}
+  .tbl.check td:first-child{width:1%;color:var(--o);font-size:15px}
+
+  /* ── code ───────────────────────────────── */
+  .code{
+    position:relative;border:1px solid var(--line);background:var(--code);
+    border-radius:var(--r-sm);overflow:hidden;
+  }
+  .code .bar{
+    display:flex;align-items:center;gap:8px;padding:8px 11px;
+    background:var(--panel-2);border-bottom:1px solid var(--line);
+  }
+  .code .bar .dot{width:8px;height:8px;border-radius:99px;background:var(--o);opacity:.85;flex:none;
+    box-shadow:0 0 9px rgba(255,122,26,.55)}
+  .code .cap{font:10px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:var(--muted)}
+  .code .bar .fill{flex:1}
+  .copy{
+    font:10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+    background:transparent;border:1px solid var(--line-2);border-radius:5px;
+    padding:5px 8px;cursor:pointer;transition:.15s;
+  }
+  .copy:hover{color:var(--o-2);border-color:var(--o-line);background:var(--o-glow)}
+  .copy.done{color:var(--moss);border-color:rgba(99,179,123,.4)}
+  .code pre{padding:14px 15px}
+  .code code{font-size:12.5px;line-height:1.62;color:#d6d3ce;display:block;white-space:pre}
+
+  /* coffee tokens */
+  .t-com{color:#6b6862;font-style:italic}
+  .t-str{color:#e8b57a}
+  .t-kw{color:var(--o);font-weight:600}
+  .t-num{color:#c2a3e8}
+  .t-fn{color:#8fd0e8}
+  .t-prop{color:#e6e3de}
+  .t-re{color:#dba0b8}
+
+  .inline{
+    padding:2px 7px;border-radius:6px;background:var(--panel-3);
+    border:1px solid var(--line-2);color:var(--o-3);font-family:var(--mono);font-size:.85em;
+  }
+  .list{margin:0;padding-left:19px;color:var(--dim);font-size:13.8px}
+  .list li{margin:6px 0}
+  .list li::marker{color:var(--o);font-size:.85em}
+  .list code{color:var(--o-3)}
+
+  /* ── pipeline diagram ───────────────────── */
+  .flow{
+    display:flex;align-items:stretch;gap:0;flex-wrap:wrap;
+    border:1px solid var(--line);background:
+      linear-gradient(180deg,rgba(255,122,26,.05),transparent 70%),var(--panel-2);
+    border-radius:var(--r-sm);padding:16px 14px;
+  }
+  .node{
+    flex:1 1 118px;min-width:112px;text-align:center;padding:11px 8px;border-radius:var(--r-xs);
+    background:var(--panel);border:1px solid var(--line-2);
+  }
+  .node b{display:block;font:11.5px/1.3 var(--mono);color:var(--o-2)}
+  .node span{display:block;margin-top:5px;font-size:10.5px;color:var(--muted);line-height:1.35}
+  .node.pure{border-color:var(--o-line);background:linear-gradient(180deg,var(--o-glow),transparent),var(--panel)}
+  .arrow{display:flex;align-items:center;color:var(--faint);font-size:15px;padding:0 6px;flex:none}
+  @media(max-width:760px){.arrow{transform:rotate(90deg);padding:4px 0;width:100%;justify-content:center}}
+
+  /* ── pills / states ─────────────────────── */
+  .pill{
+    display:inline-block;font:10.5px/1 var(--mono);letter-spacing:.06em;padding:5px 9px;
+    border-radius:999px;border:1px solid var(--line-2);background:var(--panel-3);color:var(--dim);
+    margin:2px 3px 2px 0;
+  }
+  .pill.q{color:var(--muted)}
+  .pill.i{color:var(--amber);border-color:rgba(245,166,35,.35);background:rgba(245,166,35,.08)}
+  .pill.r{color:var(--o-2);border-color:var(--o-line);background:var(--o-glow)}
+  .pill.d{color:var(--moss);border-color:rgba(99,179,123,.35);background:rgba(99,179,123,.08)}
+  .pill.e{color:var(--rust);border-color:rgba(229,72,77,.35);background:rgba(229,72,77,.08)}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:0}
+
+  /* ── split cards (deterministic vs llm) ── */
+  .split{border:1px solid var(--line-2);background:var(--panel-2);border-radius:var(--r-sm);padding:15px}
+  .split.hot{border-color:var(--o-line);
+    background:linear-gradient(180deg,var(--o-glow),transparent 55%),var(--panel-2)}
+
+  .hr{height:1px;background:linear-gradient(90deg,var(--line),transparent);margin:16px 0}
+  .foot{color:var(--muted);font:11px/1.6 var(--mono);letter-spacing:.04em}
+  .foot b{color:var(--o-2);font-weight:600}
+
+  .to-top{
+    position:fixed;right:22px;bottom:22px;z-index:70;width:38px;height:38px;border-radius:11px;
+    display:grid;place-items:center;cursor:pointer;opacity:0;pointer-events:none;transition:.22s;
+    background:var(--panel-2);border:1px solid var(--line-2);color:var(--o-2);font-size:15px;
+  }
+  .to-top.show{opacity:1;pointer-events:auto}
+  .to-top:hover{border-color:var(--o-line);background:var(--o-glow)}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="in">
+    <span class="brand"><span class="ghost">👻</span> <b>sheets</b></span>
+    <span class="crumb">stage contract</span>
+    <span class="spacer"></span>
+    <span class="tag">.sheets/stages/&lt;slug&gt;.coffee</span>
+  </div>
+  <div class="progress" id="prog"></div>
+</header>
+
+<div class="wrap">
+
+  <!-- ══ HERO ══════════════════════════════════════════ -->
+  <section class="hero">
+    <div class="kicker">developer contract</div>
+    <h1>Stage Contract</h1>
+    <p class="lede">
+      One <code>.coffee</code> file per column. A <code>gate</code> predicate decides when a cell may run;
+      <code>reduce</code> does the work and returns a patch over a deep-frozen entity, shallow-merged two
+      levels deep. <code>reduce</code> may do real I/O — files, network, LLM calls with live tools.
+      Capabilities arrive through <code>ctx</code>.
+    </p>
+  </section>
+
+  <div class="grid">
+
+    <!-- ══ TOC ═════════════════════════════════════════ -->
+    <nav class="toc" id="toc">
+      <h3>Contents</h3>
+      <a href="#mental"><span class="n">01</span> Mental model</a>
+      <a href="#schema"><span class="n">02</span> Entity &amp; activity schema</a>
+      <a href="#file"><span class="n">03</span> File &amp; naming</a>
+      <a href="#exports"><span class="n">04</span> Exports at a glance</a>
+      <a href="#meta"><span class="n">05</span> meta</a>
+      <a href="#gate"><span class="n">06</span> gate</a>
+      <a href="#reduce"><span class="n">07</span> reduce</a>
+      <a href="#ctx"><span class="n">08</span> ctx surface</a>
+      <a href="#merge"><span class="n">09</span> Patch &amp; merge</a>
+      <a href="#clear"><span class="n">10</span> clear (Delete)</a>
+      <a href="#views"><span class="n">11</span> views.cell</a>
+      <a href="#mount"><span class="n">12</span> views.mount</a>
+      <a href="#rpc"><span class="n">13</span> rpc → stage router</a>
+      <a href="#rest"><span class="n">14</span> Entity REST API</a>
+      <a href="#sort"><span class="n">15</span> sort</a>
+      <a href="#lifecycle"><span class="n">16</span> Lifecycle &amp; queue</a>
+      <a href="#deterministic"><span class="n">17</span> Deterministic vs LLM</a>
+      <a href="#llm"><span class="n">18</span> LLM pattern</a>
+      <a href="#errors"><span class="n">19</span> Errors &amp; idle</a>
+      <a href="#coffee"><span class="n">20</span> CoffeeScript rules</a>
+      <a href="#perf"><span class="n">21</span> Performance</a>
+      <a href="#examples"><span class="n">22</span> Examples</a>
+      <a href="#practices"><span class="n">23</span> Best practices</a>
+      <a href="#checklist"><span class="n">24</span> Ship checklist</a>
+      <div class="sep"></div>
+      <a href="#refs"><span class="n">→</span> References</a>
+    </nav>
+
+    <main>
+
+      <!-- ─── #mental ────────────────────────────────────── -->
+      <section id="mental" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§01</span><span class="sec-tag">mental model</span></div>
+        <h2>Rows × Columns → Jobs</h2>
+        <p class="lead">
+          Rows are entities (<code>db/&lt;id&gt;.yaml</code> or <code>db/&lt;Class&gt;/&lt;id&gt;.md</code>).
+          Columns are stages. A selection is a set of <code>(entity × stage)</code> jobs. Play enqueues
+          them; the engine runs them under a concurrency gate.
+        </p>
+
+        <div class="flow">
+          <div class="node"><b>entity.yaml</b><span>two-level map<br>component → field</span></div>
+          <div class="arrow">→</div>
+          <div class="node pure"><b>gate()</b><span>pure predicate</span></div>
+          <div class="arrow">→</div>
+          <div class="node pure"><b>reduce()</b><span>frozen entity + ctx<br>I/O allowed</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>patch</b><span>partial two-level</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>mergePatch</b><span>atomic YAML write</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>PGlite</b><span>mirror upsert</span></div>
+        </div>
+
+        <div class="cols" style="margin-top:12px">
+          <div class="callout tip"><strong>Authoritative</strong> — YAML/Markdown on disk. PGlite under
+            <code>.sheets/pgdata</code> is a disposable mirror for windowing, search and sort.</div>
+          <div class="callout"><strong>Durable</strong> — every attempt writes
+            <code>.sheets/runs/&lt;ts&gt;-&lt;id&gt;-&lt;stage&gt;.yaml</code> with status, patch/error,
+            logs, model &amp; tokens.</div>
+        </div>
+
+        <div class="callout tip" style="margin-top:12px">
+          <strong>You don't have to write stages by hand.</strong>
+          <a href="../templates/angela.coffee">Angela</a>
+          is an <em>agent instance</em> trained to implement stage code on demand — describe a column in one
+          sentence and she writes the <code>.coffee</code> file against this contract. Her system prompt
+          imports <strong>this very page</strong>, so she is working from the same guide you are.
+          <br><br>
+          Not to be confused with the <strong>angela harness</strong> — the dependency that powers the Sheets
+          chat UI itself, and the instance's namesake. One is the runtime; the other is a character running
+          on it.
+        </div>
+      </section>
+
+      <!-- ─── #schema ────────────────────────────────────── -->
+      <section id="schema" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§02</span><span class="sec-tag">entity &amp; activity schema</span></div>
+        <h2>What a row is, what a column is</h2>
+
+        <h3>Entity — one file per row</h3>
+        <p class="lead">A database is just a <strong>directory of entity files</strong>. Two shapes load
+          as-is: flat <code>db/&lt;id&gt;.yaml</code>, and <code>db/&lt;Class&gt;/&lt;id&gt;.md</code>, whose
+          frontmatter is parsed as the document while the Markdown body is <strong>preserved untouched</strong>
+          on write. Fields live in a two-level <code>component → field</code> map. An entity does not carry its
+          own id — the filename is the id, which is why <code>ctx.entityId</code> exists (§08).</p>
+
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">db/&lt;id&gt;.yaml</span><span class="fill"></span></div>
+          <pre><code>produce:
+  name: 'Blood orange'
+appearance:
+  color: '#c0392b'
+shipping:
+  destination:
+    warehouse: 'east-dock'    # nested values are fine; patches reach them by dotted key</code></pre>
+        </div>
+
+        <h3 style="margin-top:18px">Activity — one worksheet tab</h3>
+        <p class="lead">An activity at <code>.sheets/activities/&lt;slug&gt;.yaml</code> names an entity source
+          and an ordered column list. <code>rows.source</code> resolves against the workspace root but may be
+          absolute, so one server can front several databases as separate tabs while its own config stays in
+          <code>./.sheets</code>.</p>
+
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">.sheets/activities/sheet1.yaml</span><span class="fill"></span></div>
+          <pre><code>title: Produce
+rows:
+  source: db            # any directory of entity files; absolute paths allowed
+columns:
+  - field: produce.name         # displays/edits one field — NOT playable
+  - stage: fruit-color          # executable stage column
+  - stage: average-volume</code></pre>
+        </div>
+
+        <div class="tbl" style="margin-top:12px">
+          <table>
+            <thead><tr><th>Column</th><th>Form</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td>Field</td><td><code>{field: 'component.field'}</code></td><td>Displays and edits one value. It has no <code>reduce</code>, so it is <strong>not playable</strong>.</td></tr>
+              <tr><td>Stage</td><td><code>{stage: '&lt;slug&gt;'}</code></td><td>Executable. Resolves to <code>.sheets/stages/&lt;slug&gt;.coffee</code> (§03).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn" style="margin-top:12px"><strong>A1 coordinates are ephemeral.</strong> A
+          range like <code>B3:D4</code> is resolved <em>at enqueue time</em> against the activity's ordered
+          columns and the row-ordered entity ids — it is never stored as a column's identity. Reorder or hide
+          columns and the same letters address different stages. A range is a selection gesture, not a
+          reference.</div>
+      </section>
+
+      <section id="file" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§03</span><span class="sec-tag">file &amp; naming</span></div>
+        <h2>Where stages live</h2>
+        <div class="tbl">
+          <table>
+            <tr><th>Path</th><td><code>.sheets/stages/&lt;slug&gt;.coffee</code> — one file per stage</td></tr>
+            <tr><th>Activity ref</th><td><code>.sheets/activities/&lt;activity&gt;.yaml</code> → <code>columns: [{stage: &lt;slug&gt;}]</code> (no <code>.coffee</code> suffix)</td></tr>
+            <tr><th>Slug</th><td><code>/^[a-z0-9-]+$/</code> recommended; derived from prompt via <code>promptStageSlug</code> in <code>src/server.coffee</code></td></tr>
+            <tr><th>Compiled</th><td>CoffeeScript → ESM via <code>src/stages.coffee</code>; cached by <code>mtime</code>; served to the browser as <code>/stagemod/stages/&lt;slug&gt;.mjs</code></td></tr>
+          </table>
+        </div>
+        <div class="callout warn" style="margin-top:12px"><strong>Imports: allowed, with one rule.</strong>
+          Stages may import from <code>.sheets/lib/*.mjs</code> — both loaders use real URLs, and
+          <code>src/stages.coffee</code> version-stamps <code>from '../lib/*.mjs'</code> specifiers so edits
+          hot-reload. The rule is <em>who evaluates what</em>: <strong>the browser imports the whole stage
+          module to render a cell</strong>, so anything statically imported must be browser-safe. One
+          <code>node:fs</code> in a lib five levels down blanks the entire column with a CORS error. Load
+          server-only work with a dynamic <code>import()</code> inside <code>reduce</code>, which the browser
+          never evaluates.
+          <div class="code" style="margin-top:10px">
+            <div class="bar"><span class="dot"></span><span class="cap">split by loader</span><span class="fill"></span></div>
+            <pre><code>import { renderThing } from '../lib/views.mjs'      # browser-safe: static import OK
+
+export reduce = (entity, ctx) -&gt;
+  mod = await `import('../lib/remote.mjs')`         # server-only: node:, fetch, auth
+  mod.resolveThing entity, ctx
+
+export views =
+  cell: (entity) -&gt; renderThing entity</code></pre>
+          </div>
+          The backtick form is embedded JS — CoffeeScript does not parse dynamic <code>import(...)</code>
+          natively. Note a browser-safe lib imported by <code>gate</code> or <code>reduce</code> still needs a
+          <strong>server restart</strong>: only the browser route stamps mtimes, and Bun caches the
+          server-side import.</div>
+      </section>
+
+      <!-- ─── #exports ───────────────────────────────────── -->
+      <section id="exports" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§04</span><span class="sec-tag">exports</span></div>
+        <h2>Exports at a glance</h2>
+        <div class="tbl">
+          <table>
+            <thead><tr><th>Export</th><th>Required</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>meta</code></td><td>yes</td><td>Title, prompt, writes, optional model/timeout</td></tr>
+              <tr><td><code>gate</code></td><td>recommended</td><td>Cheap predicate — re-runs on every sweep; parks job as <code>idle</code> when false</td></tr>
+              <tr><td><code>reduce</code></td><td>yes</td><td>Does the work, returns a shallow patch. I/O and side effects allowed (§07)</td></tr>
+              <tr><td><code>clear</code></td><td>no</td><td>Delete handler — <code>(entity) → patch</code>, stage decides what Delete means</td></tr>
+              <tr><td><code>views</code></td><td>recommended</td><td><code>cell → {template}</code> — valid <a href="m-js-docs/index.html">M.js</a> markup; optional <code>mount</code>, <code>onKey</code>, <code>text</code> (§11–§12)</td></tr>
+              <tr><td><code>rpc</code></td><td>no</td><td>Router for user-triggered actions from a view — <code>(entity, method, ctx) → {patch, message, result}</code> (§13)</td></tr>
+              <tr><td><code>sort</code></td><td>no</td><td>Comparator <code>(a,b) → -1|0|1</code> for column sort</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code" style="margin-top:14px">
+          <div class="bar"><span class="dot"></span><span class="cap">minimal stage</span><span class="fill"></span></div>
+          <pre><code>export meta =
+  title: 'Example stage'
+  prompt: 'Describe what this stage does.'
+  writes: ['component.field']
+
+export gate = (entity) -&gt; entity?.component?.field?
+
+export reduce = (entity, ctx) -&gt;
+  component: field: 'value'
+
+esc = (s) -&gt; String(s ? '').replace /[&amp;&lt;&gt;"']/g, (c) -&gt; '&amp;#' + c.charCodeAt(0) + ';'
+
+export views =
+  cell: (entity) -&gt;
+    v = entity?.component?.field
+    template: "&lt;span&gt;#{esc v}&lt;/span&gt;"</code></pre>
+        </div>
+      </section>
+
+      <!-- ─── #meta ──────────────────────────────────────── -->
+      <section id="meta" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§05</span><span class="sec-tag">meta</span></div>
+        <h2>Identity &amp; writes</h2>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">meta</span><span class="fill"></span></div>
+          <pre><code>export meta =
+  title: 'Fruit color'                          # column header
+  prompt: 'Assign the fruit its canonical display color.'  # verbatim user sentence
+  writes: ['appearance.color']                 # fields this stage may patch
+  model: 'lm-studio:google/gemma-4-12b-qat'    # optional override (else ws.model)
+  timeout_ms: 300000                           # optional (default 300s)</code></pre>
+        </div>
+        <ul class="list" style="margin-top:12px">
+          <li><code>writes</code> is documentation + cleanup hint (delete-column). Keep it in sync with the patch you return.</li>
+          <li><code>prompt</code> should be the user's original sentence verbatim — it is also the default LLM prompt.</li>
+          <li><code>model</code> resolution: <code>meta.model → .sheets/config.yaml:model → $FAV_LOCAL_LLM → AGL default</code>.</li>
+        </ul>
+      </section>
+
+      <!-- ─── #gate ──────────────────────────────────────── -->
+      <section id="gate" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§06</span><span class="sec-tag">gate</span></div>
+        <h2>gate(entity) → boolean</h2>
+        <p class="lead">A predicate over the entity — sync or <code>async</code>; the engine awaits it.
+          <code>true</code> = runnable now; <code>false</code> or
+          thrown = parked as <code>idle</code> until another stage fills upstream fields. The engine
+          re-evaluates idle jobs on a 5s sweep and after each merge.</p>
+        <div class="cols">
+          <div class="code">
+            <div class="bar"><span class="dot"></span><span class="cap">gate patterns</span><span class="fill"></span></div>
+            <pre><code># upstream deps only — don't check "already written"
+export gate = (entity) -&gt;
+  name = entity.produce?.name
+  name? and String(name).trim() isnt ''
+
+# multi-dep example
+export gate = (entity) -&gt;
+  present = (v) -&gt; v? and String(v).trim() isnt ''
+  present(entity.produce?.name) and present(entity.appearance?.color) and present(entity.animal?.name)</code></pre>
+          </div>
+          <div class="stack">
+            <div class="callout warn"><strong>Do:</strong> check upstream fields you read.
+              <strong>Don't:</strong> check the field you write — that parks re-plays as
+              <code>idle</code> forever. Idempotence belongs in <code>reduce</code> (return <code>{}</code>).</div>
+            <div class="callout"><strong>Engine:</strong> <code>src/engine.coffee#_gatePass</code> — loads
+              stage, clones doc, <code>!!await gate(clone)</code>. Exceptions → <code>false</code> (idle).</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─── #reduce ────────────────────────────────────── -->
+      <section id="reduce" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§07</span><span class="sec-tag">reduce</span></div>
+        <h2>reduce(entity, ctx) → patch</h2>
+        <p class="lead">The working end of a stage. Receives a <strong>deep-frozen</strong> clone of the
+          entity — never mutate it — plus <code>ctx</code>, and returns a <strong>partial two-level
+          patch</strong> <code>{component: {field: value}}</code>. The engine shallow-merges it, atomically
+          rewrites YAML, and upserts the mirror.</p>
+        <div class="callout tip" style="margin-bottom:14px"><strong>reduce is not a pure function.</strong>
+          Side effects are expected: read and write files, call HTTP APIs, shell out, drive an LLM whose tools
+          themselves mutate remote systems. "Pure reducer" was an early design constraint that did not survive
+          contact with real stages — <code>promote</code>-style transporters exist precisely to change the
+          outside world. The frozen entity and the returned patch are the contract; how you arrive at that
+          patch is up to you.</div>
+        <div class="tbl">
+          <table>
+            <tr><th>Input</th><td><code>entity</code> is <code>Object.freeze</code> + recursive freeze (<code>src/entities.coffee#deepFreeze</code>). Mutations throw.</td></tr>
+            <tr><th>Output</th><td>Patch object. Missing/empty → no-op. Field values <strong>replace wholesale</strong> (objects/arrays too). <code>null</code> is a value, not a deletion.</td></tr>
+            <tr><th>Side effects</th><td><strong>Allowed and common.</strong> <code>fs</code>, <code>fetch</code>, child processes, authenticated remote writes, and <code>ctx.Agent</code> runs whose tools do all of the above. Pass <code>ctx.signal</code> to anything cancellable so stop/timeout can abort it.</td></tr>
+            <tr><th>The real rules</th><td>Don't mutate the frozen <code>entity</code>. Return the patch rather than writing entity YAML yourself. Make re-play safe (see Idempotence). For irreversible work, refuse <em>before</em> the first remote write and record which guard stopped it.</td></tr>
+            <tr><th>Idempotence</th><td>Check <code>already set</code> inside <code>reduce</code> and return <code>{}</code> with a <code>ctx.log</code> — keeps re-play cheap.</td></tr>
+            <tr><th>Errors</th><td><code>throw new Error '…'</code> to fail the cell (→ <code>error</code> state, durable log). Don't return error objects.</td></tr>
+          </table>
+        </div>
+        <div class="code" style="margin-top:12px">
+          <div class="bar"><span class="dot"></span><span class="cap">deterministic reduce</span><span class="fill"></span></div>
+          <pre><code>export reduce = (entity, ctx) -&gt;
+  if entity.appearance?.color? and String(entity.appearance.color).trim() isnt ''
+    ctx.log "skip #{entity.produce.name}: appearance.color already set"
+    return {}
+  name = String(entity.produce.name).toLowerCase()
+  color = colors[name] ? fallbackColor(name)
+  ctx.log "#{name} → #{color}"
+  appearance: color: color</code></pre>
+        </div>
+      </section>
+
+      <!-- ─── #ctx ───────────────────────────────────────── -->
+      <section id="ctx" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§08</span><span class="sec-tag">ctx</span></div>
+        <h2>ctx surface (injected)</h2>
+        <div class="tbl">
+          <table>
+            <tr><th>ctx.Agent</th><td><code>agl-ai</code> factory — <code>await ctx.Agent.factory({...})</code>. Register with <code>ctx.onAgent(agent)</code> so stop/timeout can abort.</td></tr>
+            <tr><th>ctx.model</th><td>Resolved model string (<code>meta.model ?? ws.model ?? Agent.default.model</code>).</td></tr>
+            <tr><th>ctx.yaml(obj)</th><td><code>js-yaml dump</code> — use to embed the entity in <code>system_prompt</code>.</td></tr>
+            <tr><th>ctx.log(…)</th><td>Captured via <code>AsyncLocalStorage</code> → run log + live <code>log</code> events. <code>console.log</code> inside <code>reduce</code> is captured too.</td></tr>
+            <tr><th>ctx.signal</th><td><code>AbortSignal</code> for the job — pass to fetches/agents.</td></tr>
+            <tr><th>ctx.onAgent</th><td>Register agent for abort on stop/timeout.</td></tr>
+            <tr><th>ctx.entityId<br>ctx.stageId</th><td>Current job identifiers. Entities do not contain their own id.</td></tr>
+          </table>
+        </div>
+        <div class="callout" style="margin-top:12px"><strong>Timeout:</strong>
+          <code>Number(meta.timeout_ms ?? ws.timeout_ms ?? 300000)</code> — the engine wraps
+          <code>reduce</code> in <code>_withTimeout</code>; on expiry it aborts the
+          <code>AbortController</code> + agents and fails the job.</div>
+      </section>
+
+      <!-- ─── #merge ─────────────────────────────────────── -->
+      <section id="merge" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§09</span><span class="sec-tag">patch &amp; merge</span></div>
+        <h2>Shallow two-level merge</h2>
+        <p class="lead"><code>src/entities.coffee#mergePatch</code> — for each <code>component → fields</code>,
+          field values replace wholesale. Dotted field keys are applied via <code>setAtPath</code>
+          (e.g. <code>'a.b.c': 1</code> → <code>{a:{b:{c:1}}}</code>).</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">patch examples</span><span class="fill"></span></div>
+          <pre><code>{ appearance: color: '#c0392b' }                 # → doc.appearance.color = '#c0392b'
+{ animal: name: 'Capuchin monkey' }             # → doc.animal.name = '…'
+{ shipping: 'destination.warehouse': 'east-dock' }  # dotted key → nested set
+{}                                              # no-op (idempotent skip)
+{ animal: noise: null }                         # null is a value, not deletion</code></pre>
+        </div>
+        <div class="callout warn" style="margin-top:12px">Fields accrue — there is no deletion via patch. To
+          remove a field, edit the YAML or use a dedicated cleanup stage.</div>
+      </section>
+
+      <!-- ─── #clear ─────────────────────────────────────── -->
+      <section id="clear" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§10</span><span class="sec-tag">clear · delete</span></div>
+        <h2>clear(entity) → patch</h2>
+        <p class="lead">Optional export. Called when the user hits <code>Delete</code>/<code>Backspace</code> on
+          a stage cell. Entirely stage-defined — return a patch merged via <code>mergePatch</code> (same
+          semantics as <code>reduce</code>). If absent, Delete falls back to deleting <code>writes[0]</code>.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">column A — reset to black, keep chrome</span><span class="fill"></span></div>
+          <pre><code># `delete` is reserved in CoffeeScript — use `clear`
+export clear = (entity) -&gt;
+  appearance: color: '#000000'
+
+# view keeps swatch even when "cleared" — user sees reset, not blank
+export views =
+  cell: (entity) -&gt;
+    color = entity.appearance?.color ? ''
+    return template: '&lt;span style="color:#666"&gt;—&lt;/span&gt;' unless color
+    template: """&lt;div class="cell-swatch"&gt;&lt;span class="swatch" style="background:#{esc color}"&gt;&lt;/span&gt;&lt;span&gt;#{esc color}&lt;/span&gt;&lt;/div&gt;"""</code></pre>
+        </div>
+        <div class="cols" style="margin-top:12px">
+          <div class="callout"><strong>Nuance:</strong> views often show compound chrome (swatches, buttons,
+            charts) that should survive a clear. <code>clear</code> decides what "empty" means — e.g. hex color
+            → <code>#000000</code> (black swatch stays) vs <code>''</code> (view shows <code>—</code>). The view
+            must handle both.</div>
+          <div class="callout warn"><strong>Contract:</strong> <code>clear</code> is pure, synchronous, no
+            <code>ctx</code>. Return <code>{}</code> for no-op. The server calls it inside
+            <code>POST /api/entities/blank</code> for stage cells; field cells still use
+            <code>deleteAtPath</code>.</div>
+        </div>
+        <div class="tbl" style="margin-top:12px">
+          <table>
+            <thead><tr><th>Stage</th><th>clear patch</th><th>View after Delete</th></tr></thead>
+            <tbody>
+              <tr><td><code>fruit-color</code> (A)</td><td><code>appearance: color: '#000000'</code></td><td>black swatch + <code>#000000</code></td></tr>
+              <tr><td><code>average-volume…</code> (B)</td><td><code>produce: volume_inches_cubed: ''</code></td><td><code>—</code></td></tr>
+              <tr><td><code>fruit-eater</code> (C)</td><td><code>animal: name: ''</code></td><td><code>—</code></td></tr>
+              <tr><td><code>animal-sleep</code> (D)</td><td><code>animal: sleep_pattern: ''</code></td><td><code>—</code></td></tr>
+              <tr><td><code>color-fruit…</code> (E)</td><td><code>animal: noise: ''</code></td><td><code>—</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ─── #views ─────────────────────────────────────── -->
+      <section id="views" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§11</span><span class="sec-tag">views</span></div>
+        <h2>views.cell — the static projection</h2>
+        <p class="lead">View functions render into the grid through
+          <a href="m-js-docs/index.html">M.js</a>, the
+          hyperscript/VDOM runtime the Sheets browser app is built on — so whatever
+          <code>template</code> returns must be <strong>valid M.js markup</strong>, not arbitrary HTML.
+          The browser mounts it via <code>x-html</code>: self-contained static markup with escaped
+          interpolations, no directives, no bindings, no mutations. Behavior and server calls belong in
+          <code>views.mount</code> (§12), not here.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">views.cell</span><span class="fill"></span></div>
+          <pre><code>esc = (s) -&gt; String(s ? '').replace /[&amp;&lt;&gt;"']/g, (c) -&gt; '&amp;#' + c.charCodeAt(0) + ';'
+
+export views =
+  cell: (entity) -&gt;
+    v = entity.produce?.volume_inches_cubed
+    return template: '&lt;span style="color:#8b8f99"&gt;—&lt;/span&gt;' unless v? and Number.isFinite Number(v)
+    template: '&lt;span class="num-cell"&gt;' + esc(Number(v).toFixed(1)) + ' in³&lt;/span&gt;'
+
+  # multi-line opt-in — row grows with content (≤500 rows: rows-natural)
+  # template: '&lt;div class="cell-tall noise-cell"&gt;' + esc(noise) + '&lt;/div&gt;'</code></pre>
+        </div>
+        <ul class="list" style="margin-top:12px">
+          <li>Always escape — <code>template</code> is inserted as HTML.</li>
+          <li>Use <code>class="cell-tall"</code> to opt into multi-line layout.</li>
+          <li>Views do <strong>not</strong> prove <code>reduce</code> ran — they read persisted YAML only.</li>
+          <li>Structured values: <code>JSON.stringify</code> + escape; never rely on implicit <code>[object Object]</code>.</li>
+          <li>Export <code>text(entity)</code> alongside <code>cell</code> — the server evaluates it for column
+            filtering and the "Top values" facet, so computed states stay filterable. Build it as
+            <code>plain(cell…)</code>, never as a second hand-written string, or the searchable text drifts
+            from the visible text.</li>
+        </ul>
+
+        <div class="callout tip" style="margin-top:14px"><strong>Why <code>views.text</code> is worth the
+          trouble.</strong> Derived states — <code>BLOCKED</code>, <code>SUPPRESSED</code>,
+          <code>READY</code> — are computed, never persisted, so without a text projection they are invisible
+          to search and unfilterable. With one, the facet turns the corpus into <em>measured counts</em>:
+          filtering a promote column returned <code>41 ALREADY_MOVED</code> and <code>14 SUPPRESSED</code>,
+          independently reproducing numbers that three planning documents disagreed about. Reconcile a plan
+          against the store before trusting the plan.</div>
+      </section>
+
+      <!-- ─── #mount ─────────────────────────────────────── -->
+      <section id="mount" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§12</span><span class="sec-tag">views.mount · live cells</span></div>
+        <h2>views.mount(el, ctx) — behavior</h2>
+        <p class="lead"><code>views.cell</code> is a static string; <code>views.mount</code> is where a cell
+          becomes interactive. It runs after the template is in the DOM, receives the host element and a
+          <strong>browser-side ctx</strong>, and returns an unmount function. This is the hook that lets a cell
+          call the server — <code>ctx.rpc</code> (§13) and <code>ctx.patchEntity</code> (§14).</p>
+
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">interactive cell</span><span class="fill"></span></div>
+          <pre><code>export views =
+  cell: (entity) -&gt;
+    template: """&lt;button class="mv-btn" data-act="resolve"&gt;Resolve&lt;/button&gt;"""
+
+  mount: (el, ctx) -&gt;
+    btn = el.querySelector '[data-act="resolve"]'
+    return unless btn
+    onClick = (e) -&gt;
+      e.preventDefault()
+      btn.disabled = true
+      try
+        await ctx.rpc 'resolve', { force: false }   # → §13
+      finally
+        btn.disabled = false
+    btn.addEventListener 'click', onClick
+    -&gt; btn.removeEventListener 'click', onClick     # unmount fn
+
+  onKey: (e, ctx) -&gt;
+    return false unless e.key is 'Enter'
+    ctx.openEditor key: 'binding', component: 'dataset'
+    true                                            # true = key consumed</code></pre>
+        </div>
+
+        <h3 style="margin-top:18px">Browser-side ctx</h3>
+        <div class="tbl">
+          <table>
+            <tr><th>ctx.entity</th><td>Live getter — always the current doc for this row, not a snapshot taken at mount time.</td></tr>
+            <tr><th>ctx.entityId<br>ctx.stage<br>ctx.activity</th><td>Identity of the cell being rendered.</td></tr>
+            <tr><th>ctx.columnIndex<br>ctx.rowIndex</th><td>Grid position; <code>rowIndex</code> is absolute (window offset applied).</td></tr>
+            <tr><th>ctx.rpc(method, args)</th><td>Call this stage's <code>rpc</code> export on the server — <strong>§13</strong>.</td></tr>
+            <tr><th>ctx.patchEntity(patch)</th><td>Write a two-level patch to this entity over REST — <strong>§14</strong>.</td></tr>
+            <tr><th>ctx.canPersist()</th><td><code>false</code> while the client is desynced; both calls above refuse and toast.</td></tr>
+            <tr><th>ctx.openEditor(editor)<br>ctx.closeEditor()</th><td>Open/close the stage editor panel anchored to this cell.</td></tr>
+            <tr><th>ctx.setStageEditing(on, draft)<br>ctx.isStageEditing()<br>ctx.getStageEditDraft()</th><td>Inline edit state for the cell, preserved across redraws.</td></tr>
+            <tr><th>ctx.showToast(msg)</th><td>Transient message in the app shell.</td></tr>
+            <tr><th>ctx.redraw()</th><td>Escape hatch for widgets that mutate outside the reactive root. Prefer writing reactive fields.</td></tr>
+          </table>
+        </div>
+
+        <div class="cols" style="margin-top:12px">
+          <div class="callout tip"><strong>Remount rule:</strong> the grid remounts only when the host node was
+            rewritten (the <code>cell</code> string changed) or the entity under that key changed. Unchanged
+            templates survive ordinary redraws, so mounted widgets and listeners persist — build expensive
+            widgets in <code>mount</code>, not <code>cell</code>.</div>
+          <div class="callout warn"><strong>Always return the unmount.</strong> Cells scroll out of the virtual
+            window constantly. A mount that adds listeners, timers, or observers without returning a teardown
+            leaks one set per scroll pass.</div>
+        </div>
+      </section>
+
+      <!-- ─── #rpc ───────────────────────────────────────── -->
+      <section id="rpc" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§13</span><span class="sec-tag">rpc · view → server → stage</span></div>
+        <h2>rpc(entity, method, ctx) — user-triggered actions</h2>
+        <p class="lead">The escape hatch from the run queue. A view calls <code>ctx.rpc(method, args)</code>, the
+          browser POSTs <code>/api/rpc</code>, and the server routes it into <em>your stage's own</em>
+          <code>rpc</code> export — which can do anything: hit a remote API, query a service, compute a
+          proposal. Return a patch and Sheets persists it atomically, exactly like <code>reduce</code>.</p>
+
+        <div class="flow" style="margin-bottom:14px">
+          <div class="node"><b>views.mount</b><span>ctx.rpc(method, args)</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>POST /api/rpc</b><span>activity · id · stage<br>method · args</span></div>
+          <div class="arrow">→</div>
+          <div class="node pure"><b>export rpc</b><span>your router fn<br>in the stage</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>{ patch }</b><span>mergePatch → YAML<br>→ mirror</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><b>row updates</b><span>doc replaced<br>+ toast</span></div>
+        </div>
+
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">stage — the router</span><span class="fill"></span></div>
+          <pre><code>export rpc = (entity, method, ctx) -&gt;
+  switch method
+    when 'resolve'
+      remote = await `import('../lib/remote.mjs')`   # server-only, like reduce
+      hit = await remote.lookup entity, ctx.args, signal: ctx.signal
+      ctx.log "resolved #{hit.id}"
+      # returning a patch persists it; message/result go back to the view
+      { patch: { dataset: binding: hit.id }, message: "bound → #{hit.id}" }
+
+    when 'list'
+      # read-only form — no patch, just data for the view to render
+      { result: await remote.listCandidates entity }
+
+    else
+      throw new Error "unknown RPC method: #{method}"</code></pre>
+        </div>
+
+        <div class="cols" style="margin-top:12px">
+          <div class="stack">
+            <div class="callout"><strong>Server-side rpc ctx</strong> — <code>entityId</code>,
+              <code>activity</code>, <code>source</code>, <code>args</code>, <code>signal</code>,
+              <code>log</code>. Note it is <strong>not</strong> the <code>reduce</code> ctx: there is no
+              <code>Agent</code>, <code>model</code>, <code>yaml</code>, or <code>onAgent</code>.</div>
+            <div class="callout"><strong>Response</strong> —
+              <code>{ ok, doc, message, result }</code>. The browser swaps in the returned <code>doc</code>,
+              reschedules mounts, and toasts <code>message</code>.</div>
+          </div>
+          <div class="tbl">
+            <table>
+              <thead><tr><th>Guard</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td>Missing/invalid entity id, stage, or method</td><td><code>400</code></td></tr>
+                <tr><td>Stage is not a column in that activity</td><td><code>403</code></td></tr>
+                <tr><td>Entity file not found</td><td><code>404</code></td></tr>
+                <tr><td>Stage fails to compile/load</td><td><code>400</code></td></tr>
+                <tr><td>Stage exports no <code>rpc</code></td><td><code>404</code></td></tr>
+                <tr><td>Handler throws / patch not an object</td><td><code>500</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="callout err" style="margin-top:12px"><strong>RPC is not a stage run.</strong> No gate, no
+          queue, no concurrency limit, no <code>.sheets/runs/</code> entry — and it may mutate remote systems
+          irreversibly. Keep its controls narrow, state-gated, and clearly named. The operator's click
+          <em>is</em> the confirmation; the agent never invokes one.</div>
+      </section>
+
+      <!-- ─── #rest ──────────────────────────────────────── -->
+      <section id="rest" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§14</span><span class="sec-tag">entity rest api</span></div>
+        <h2>Mutating entities from a view</h2>
+        <p class="lead">Views can edit entity resources directly over REST — no stage run involved. From a
+          mount, <code>ctx.patchEntity(patch)</code> wraps <code>PATCH /api/entity/:id</code> with the desync
+          guard, <code>keepalive</code>, and a local row update so the grid reflects the write immediately.</p>
+
+        <div class="tbl">
+          <table>
+            <thead><tr><th>Endpoint</th><th>Method</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>/api/entity/&lt;id&gt;</code></td><td>GET</td><td>Returns <code>{ id, doc }</code>.</td></tr>
+              <tr><td><code>/api/entity/&lt;id&gt;</code></td><td>PATCH</td><td><code>mergePatch</code> → atomic YAML write → mirror upsert → <code>engine.pump()</code>.</td></tr>
+              <tr><td><code>/api/entity/&lt;id&gt;</code></td><td>DELETE</td><td>Stops queued cells for every stage, removes the file and the mirror row.</td></tr>
+              <tr><td><code>/api/entity/&lt;id&gt;/rename</code></td><td>POST</td><td><code>400</code> invalid id, <code>409</code> if the target already exists.</td></tr>
+              <tr><td><code>/api/entities</code></td><td>POST</td><td>Create entities.</td></tr>
+              <tr><td><code>/api/entities/delete</code><br><code>/api/entities/duplicate</code></td><td>POST</td><td>Bulk operations over a selection.</td></tr>
+              <tr><td><code>/api/entities/blank</code></td><td>POST</td><td>Delete-key clear. Stage cells call <code>clear</code> (§10); field cells use <code>deleteAtPath</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code" style="margin-top:12px">
+          <div class="bar"><span class="dot"></span><span class="cap">two accepted PATCH bodies</span><span class="fill"></span></div>
+          <pre><code># 1 — full two-level patch (same semantics as a reduce return, §09)
+{ patch: { dataset: { binding: 'orders-v2' } } }
+
+# 2 — single field; `field` may be a nested dotted path under the component
+{ component: 'publish', field: 'destination.namespace', value: 'team-alpha' }
+
+# from inside views.mount:
+await ctx.patchEntity dataset: binding: 'orders-v2'</code></pre>
+        </div>
+
+        <div class="cols" style="margin-top:12px">
+          <div class="callout tip"><strong>A patch can wake the queue.</strong> The handler calls
+            <code>engine.pump()</code> after persisting, so writing an upstream field from a view can
+            immediately un-park downstream cells sitting in <code>idle</code> (§06).</div>
+          <div class="callout warn"><strong>Same merge rules apply</strong> (§09): values replace wholesale,
+            <code>null</code> is a value rather than a deletion, and there is no delete-by-patch. A desynced
+            client refuses to persist — check <code>ctx.canPersist()</code> before offering the control.</div>
+        </div>
+      </section>
+
+      <!-- ─── #sort ──────────────────────────────────────── -->
+      <section id="sort" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§15</span><span class="sec-tag">sort · optional</span></div>
+        <h2>Column sort comparator</h2>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">sort</span><span class="fill"></span></div>
+          <pre><code>export sort = (a, b) -&gt;
+  x = a.appearance?.color ? ''
+  y = b.appearance?.color ? ''
+  if x &lt; y then -1 else if x &gt; y then 1 else 0</code></pre>
+        </div>
+        <p class="lead" style="margin-top:12px">Pure comparator over two entities. <code>Alt+click</code> on a
+          header toggles <code>asc/desc</code>; the stage's <code>sort</code> is the default when no user sort
+          is set.</p>
+      </section>
+
+      <!-- ─── #lifecycle ─────────────────────────────────── -->
+      <section id="lifecycle" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§16</span><span class="sec-tag">lifecycle &amp; queue</span></div>
+        <h2>From selection to durable log</h2>
+        <div class="tbl">
+          <table>
+            <tr><th>Enqueue</th><td><code>engine.enqueue(cells)</code> — dedupes by <code>source+id+stage</code>; ignores anything already <code>queued/idle/running</code>.</td></tr>
+            <tr><th>Gate</th><td><code>_gatePass</code> — <code>!reduce → false</code>, no gate → <code>true</code>, else <code>!!await gate(clone)</code>. False → <code>idle</code>.</td></tr>
+            <tr><th>Launch</th><td>Only if <code>running &lt; concurrency</code>. Locks the entity file path; sets <code>running</code>, captures logs via <code>AsyncLocalStorage</code>.</td></tr>
+            <tr><th>Run</th><td><code>_run</code> — deep-freeze clone, <code>ctx</code>, <code>_withTimeout</code>, <code>mergePatch</code>, atomic <code>writeEntityFile</code>, <code>store.upsert</code>, emit <code>entity</code> + <code>cell done</code>.</td></tr>
+            <tr><th>States</th><td>
+              <span class="pill q">queued</span><span class="pill i">idle</span><span class="pill r">running</span><span class="pill d">done</span><span class="pill e">error</span>
+              <div style="margin-top:8px;font-size:12.5px"><code>queued</code> forever = concurrency 0 &nbsp;·&nbsp; <code>idle</code> = gate false</div>
+            </td></tr>
+            <tr><th>Logs</th><td>Ring buffer (2000) + per-attempt YAML in <code>.sheets/runs/</code> with <code>patch/error/stack/model/tokens</code>.</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <!-- ─── #deterministic ─────────────────────────────── -->
+      <section id="deterministic" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§17</span><span class="sec-tag">deterministic vs llm</span></div>
+        <h2>Choose the right kind</h2>
+        <div class="cols">
+          <div class="split">
+            <h3>Deterministic</h3>
+            <p class="lead" style="font-size:13.5px">Fixed maps, normalization, arithmetic, trivial
+              transforms. No model needed — runnable immediately after <code>sheets serve</code>.</p>
+            <div class="code">
+              <div class="bar"><span class="dot"></span><span class="cap">deterministic reduce</span><span class="fill"></span></div>
+              <pre><code>export reduce = (entity) -&gt;
+  unit = entity?.produce?.unit ? 'each'
+  produce: unit: unit</code></pre>
+            </div>
+          </div>
+          <div class="split hot">
+            <h3>LLM (agentic)</h3>
+            <p class="lead" style="font-size:13.5px">Subjective/generative work — prose, judgments,
+              classifications. Must use <code>ctx.Agent</code> + <code>output_tool</code> (structured, not
+              free-form).</p>
+            <div class="code">
+              <div class="bar"><span class="dot"></span><span class="cap">see §18</span><span class="fill"></span></div>
+              <pre><code># see §18 — output_tool + ctx.onAgent required</code></pre>
+            </div>
+          </div>
+        </div>
+        <div class="callout warn" style="margin-top:12px">Don't call an LLM because the workflow is agentic —
+          use deterministic code when the answer is mechanical.</div>
+      </section>
+
+      <!-- ─── #llm ───────────────────────────────────────── -->
+      <section id="llm" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§18</span><span class="sec-tag">llm pattern · required</span></div>
+        <h2>Structured output via output_tool</h2>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">CoffeeScript — not JS</span><span class="fill"></span></div>
+          <pre><code>export reduce = (entity, ctx) -&gt;
+  agent = await ctx.Agent.factory
+    model: ctx.model
+    system_prompt: """
+      You are an expert botanist and geometric analyst.
+      Determine the approximate average volume of the specific fruit.
+      Return the value in cubic inches.
+      &lt;entity&gt;
+      #{ctx.yaml entity}
+      &lt;/entity&gt;
+      """
+    output_tool:
+      name: 'answer'
+      description: 'Return the average volume in cubic inches'
+      parameters:
+        volume_inches_cubed: { type: 'number', description: 'The average volume in cubic inches' }
+      required: ['volume_inches_cubed']
+      fn: (args) -&gt;
+        t = Number args.volume_inches_cubed
+        throw new Error 'volume must be a finite number' unless Number.isFinite t
+        { volume_inches_cubed: t }
+    stream: true
+    retries: 0
+  ctx.onAgent agent
+  out = await agent.run prompt: meta.prompt
+  ctx.log "Fruit: " + entity.produce?.name + " -&gt; Volume: " + out.volume_inches_cubed
+  produce: volume_inches_cubed: out.volume_inches_cubed</code></pre>
+        </div>
+        <ul class="list" style="margin-top:12px">
+          <li><code>ctx.onAgent(agent)</code> is required — it enables stop/timeout abort.</li>
+          <li><code>fn</code> validates and normalizes tool args; throw on a bad shape.</li>
+          <li>Embed <code>#{ctx.yaml entity}</code> in <code>system_prompt</code> so the model sees the full entity.</li>
+          <li><code>stream</code> + <code>retries: 0</code> is the conventional default.</li>
+        </ul>
+
+        <div class="callout tip" style="margin-top:14px">
+          <strong>ctx.Agent is <a href="agl/">AGL</a> (<code>agl-ai</code>).</strong> What you are building
+          above is a <strong>microagent</strong>: a single-purpose agent with a constrained system prompt and
+          exactly one structured <code>output_tool</code>. Before writing an LLM stage, read
+          <a href="agl/docs/MICROAGENT.md">MICROAGENT.md</a> — it explains how microagents are designed and
+          why the tool schema, not the prose, carries the contract. For a full worked agent, see
+          <a href="agl/src/agents/home.mjs">src/agents/home.mjs</a>. A stage reducer is the smallest possible
+          instance of that pattern: one entity in, one validated value out.
+        </div>
+
+        <h3 style="margin-top:20px">Wiring AGL in this environment</h3>
+        <p class="lead">The sheets package already depends on <code>agl-ai</code> and imports it once —
+          <code>import Agent from 'agl-ai'</code> in <code>src/engine.coffee</code>. That exact module object
+          is handed to you as <code>ctx.Agent</code>, so a stage never resolves the dependency itself.</p>
+
+        <div class="callout err" style="margin-bottom:12px"><strong>Do not
+          <code>import Agent from 'agl-ai'</code> in a stage or in <code>.sheets/lib/*.mjs</code>.</strong>
+          Those files live in the <em>workspace</em>, so a bare specifier resolves against the workspace's
+          <code>node_modules</code> — not the sheets package that actually owns the dependency. It will
+          usually fail outright, and if it resolves it gives you a second Agent class with its own
+          <code>Agent.default</code> and its own concurrency gate. Always go through <code>ctx.Agent</code>;
+          pass it down as an argument if a lib needs it.</div>
+
+        <div class="tbl">
+          <table>
+            <tr><th>ctx.Agent</th><td>The default export of <code>agl-ai</code> — the <code>Agent</code> class itself, not an instance.</td></tr>
+            <tr><th>ctx.Agent.factory</th><td><code>{ model, system_prompt, output_tool, tool_choice, context_window_size, parallel_tools, reasoning_effort, max_tokens, stream, on_delta, retain_history, retries }</code> → an agent instance.</td></tr>
+            <tr><th>agent.Tool(…)</th><td><code>(name, description, properties, required, fn)</code> — register a tool the model may call. <code>fn</code> runs for real; this is where a stage legitimately touches the outside world.</td></tr>
+            <tr><th>agent.run(…)</th><td><code>await agent.run prompt: meta.prompt</code> → the validated <code>output_tool</code> result.</td></tr>
+            <tr><th>ctx.Agent.default</th><td>Process-wide defaults — <code>.model</code> and <code>.concurrency</code> (1 = serial inference). The engine sets concurrency from the queue slider; don't fight it from a stage.</td></tr>
+            <tr><th>ctx.model</th><td>Already resolved for this cell: <code>meta.model ?? ws.model ?? Agent.default.model</code>. Pass it straight through.</td></tr>
+          </table>
+        </div>
+
+        <p class="lead" style="margin-top:12px">Models are <code>"provider:model"</code> strings. Providers
+          ship as subpath exports of <code>agl-ai</code> — <code>copilot</code>, <code>xai</code>,
+          <code>ollama</code>, <code>lm-studio</code>, <code>runpod</code>, <code>muse</code> — so
+          <code>'lm-studio:google/gemma-4-12b-qat'</code> selects the LM Studio provider and that model.</p>
+
+        <div class="code" style="margin-top:12px">
+          <div class="bar"><span class="dot"></span><span class="cap">agent with a tool that does real work</span><span class="fill"></span></div>
+          <pre><code>export reduce = (entity, ctx) -&gt;
+  agent = await ctx.Agent.factory
+    model: ctx.model                       # 'provider:model', already resolved
+    system_prompt: """
+      Price the item below. Call lookup_price before answering.
+      &lt;entity&gt;
+      #{ctx.yaml entity}
+      &lt;/entity&gt;
+      """
+    output_tool:
+      name: 'answer'
+      description: 'Return the unit price in USD'
+      parameters:
+        unit_price: { type: 'number', description: 'Unit price in USD' }
+      required: ['unit_price']
+      fn: (args) -&gt;
+        t = Number args.unit_price
+        throw new Error 'unit_price must be finite' unless Number.isFinite t
+        { unit_price: t }
+    stream: true
+    retries: 0
+
+  # Tools RUN. This one does network I/O — allowed, and the reason ctx.signal exists.
+  agent.Tool 'lookup_price',
+    'Look up the current list price for a SKU',
+    { sku: { type: 'string', description: 'SKU to price' } },
+    ['sku'],
+    (args) -&gt;
+      res = await fetch "https://pricing.example/api/#{args.sku}", signal: ctx.signal
+      throw new Error "lookup failed: #{res.status}" unless res.ok
+      (await res.json()).list_price
+
+  ctx.onAgent agent                        # required: lets stop/timeout abort
+  out = await agent.run prompt: meta.prompt
+  pricing: unit_price: out.unit_price</code></pre>
+        </div>
+
+        <div class="tbl" style="margin-top:12px">
+          <table>
+            <thead><tr><th>Vendored reference (checked out under <code>docs/</code>)</th><th>What it is</th></tr></thead>
+            <tbody>
+              <tr><td><a href="agl/docs/MICROAGENT.md">agl/docs/MICROAGENT.md</a></td><td>How microagents are designed — read before an LLM stage</td></tr>
+              <tr><td><a href="agl/src/agents/home.mjs">agl/src/agents/home.mjs</a></td><td>Full worked agent</td></tr>
+              <tr><td><a href="agl/src/agent.mjs">agl/src/agent.mjs</a></td><td><code>Agent</code> source: <code>factory</code>, <code>Tool</code>, <code>run</code>, <code>default</code></td></tr>
+              <tr><td><a href="m-js-docs/index.html">m-js-docs/index.html</a></td><td>M.js documentation — the view layer (§11–§12)</td></tr>
+              <tr><td><a href="m-js/src/">m-js/src/</a></td><td>M.js source</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ─── #errors ────────────────────────────────────── -->
+      <section id="errors" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§19</span><span class="sec-tag">errors, idle, retries</span></div>
+        <h2>Failure modes</h2>
+        <div class="tbl">
+          <table>
+            <tr><th>Compile error</th><td><code>src/stages.coffee#compile</code> catches CoffeeScript errors; <code>load</code> throws <code>STAGE_COMPILE</code> — job → <code>error</code> with message.</td></tr>
+            <tr><th>Import error</th><td>Dynamic <code>import(url)</code> failure → <code>STAGE_IMPORT</code> — job → <code>error</code>.</td></tr>
+            <tr><th>Gate false</th><td>Job → <code>idle</code> (not error). Re-evaluated on sweep + after merges. Check upstream fields.</td></tr>
+            <tr><th>Reduce throw</th><td>Job → <code>error</code> with <code>String(err.message)</code>; stack + logs persisted.</td></tr>
+            <tr><th>Timeout</th><td><code>_withTimeout</code> aborts signal + agents → <code>stage timeout after …ms</code>.</td></tr>
+            <tr><th>Concurrency 0</th><td>Jobs stay <code>queued</code> forever — raise the slider (persists to <code>.sheets/config.yaml</code>).</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <!-- ─── #coffee ────────────────────────────────────── -->
+      <section id="coffee" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§20</span><span class="sec-tag">coffeescript</span></div>
+        <h2>Syntax rules</h2>
+        <div class="cols">
+          <div class="tbl">
+            <table>
+              <thead><tr><th>Use</th><th>Not</th></tr></thead>
+              <tbody>
+                <tr><td><code>is</code> / <code>isnt</code></td><td><code>===</code> / <code>!==</code></td></tr>
+                <tr><td><code>and</code> / <code>or</code> / <code>not</code></td><td><code>&amp;&amp;</code> / <code>||</code> / <code>!</code></td></tr>
+                <tr><td><code>?</code> / <code>?.</code></td><td>manual null checks</td></tr>
+                <tr><td><code>"""</code> triple-quoted</td><td>JS template literals</td></tr>
+                <tr><td>bare assignments</td><td><code>const</code> / <code>let</code> / <code>var</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <strong>Pitfalls</strong>
+            <ul class="list" style="margin-top:8px">
+              <li><code>Number.isFinite Number(x)</code> — not <code>typeof x === 'number'</code></li>
+              <li>Escape in views: <code>esc = (s) -&gt; String(s ? '').replace /[&amp;&lt;&gt;"']/g, …</code></li>
+              <li>Keep modules small — Bun import via data/file URL has size limits</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─── #perf ──────────────────────────────────────── -->
+      <section id="perf" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§21</span><span class="sec-tag">performance &amp; limits</span></div>
+        <h2>What to watch</h2>
+        <ul class="list">
+          <li><strong>Row height:</strong> ≤500 rows → <code>rows-natural</code> (auto-expand via
+            <code>.cell-tall</code>); &gt;500 → <code>rows-fixed</code> (uniform <code>ROWH</code> for virtual
+            scroll). Keep <code>ROWH</code> in <code>public/app.js</code> and <code>--rowh</code> in
+            <code>public/styles.css</code> in sync.</li>
+          <li><strong>Module size:</strong> very large generated stages can hit Bun's import limit — prefer
+            short helpers.</li>
+          <li><strong>Concurrency:</strong> persisted to <code>.sheets/config.yaml</code>; the queue is a
+            single FIFO with a per-entity file lock.</li>
+          <li><strong>Hot reload:</strong> stage edits invalidate the cache; the browser re-fetches
+            <code>/stagemod/stages/&lt;slug&gt;.mjs</code> on next render.</li>
+        </ul>
+      </section>
+
+      <!-- ─── #examples ──────────────────────────────────── -->
+      <section id="examples" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§22</span><span class="sec-tag">examples</span></div>
+        <h2>Real stages (fruit)</h2>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">fruit-color.coffee — deterministic</span><span class="fill"></span></div>
+          <pre><code>export meta =
+  title: 'Fruit color'
+  prompt: 'Assign the fruit its canonical display color.'
+  writes: ['appearance.color']
+
+export gate = (entity) -&gt;
+  name = entity.produce?.name
+  name? and String(name).trim() isnt ''
+
+export reduce = (entity, ctx) -&gt;
+  if entity.appearance?.color? and String(entity.appearance.color).trim() isnt ''
+    ctx.log "skip #{entity.produce.name}: appearance.color already set"
+    return {}
+  name = String(entity.produce.name).toLowerCase()
+  color = colors[name] ? fallbackColor(name)
+  appearance: color: color</code></pre>
+        </div>
+        <div class="code" style="margin-top:12px">
+          <div class="bar"><span class="dot"></span><span class="cap">color-fruit-animal-eats-describe.coffee — LLM</span><span class="fill"></span></div>
+          <pre><code>export meta =
+  title: 'Eating noise'
+  prompt: 'Based on the color of the fruit and the animal that eats it , Describe the noise…'
+  writes: ['animal.noise']
+
+export gate = (entity) -&gt;
+  present = (v) -&gt; v? and String(v).trim() isnt ''
+  present(entity.produce?.name) and present(entity.appearance?.color) and present(entity.animal?.name)
+
+export reduce = (entity, ctx) -&gt;
+  if entity.animal?.noise? and String(entity.animal.noise).trim() isnt ''
+    ctx.log "skip #{entity.produce?.name}: animal.noise already set"
+    return {}
+  agent = await ctx.Agent.factory
+    model: ctx.model
+    system_prompt: """
+      You are an imaginative writer. Based on the animal, the fruit, and the specific color…
+      &lt;entity&gt;
+      #{ctx.yaml entity}
+      &lt;/entity&gt;
+      """
+    output_tool:
+      name: 'answer'
+      description: 'Return the noise description'
+      parameters: { noise: { type: 'string', description: '1-2 sentence description' } }
+      required: ['noise']
+      fn: (args) -&gt;
+        t = String(args.noise ? '').trim()
+        throw new Error 'noise must be non-empty' unless t.length &gt; 0
+        { noise: t }
+    stream: false
+    retries: 0
+  ctx.onAgent agent
+  out = await agent.run prompt: meta.prompt
+  animal: noise: out.noise</code></pre>
+        </div>
+      </section>
+
+      <!-- ─── #practices ─────────────────────────────────── -->
+      <section id="practices" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§23</span><span class="sec-tag">best practices</span></div>
+        <h2>Lessons from stages that shipped</h2>
+        <p class="lead">Field notes from building real columns against a ~1,000-entity corpus. Most of this is
+          non-obvious and was learned by breaking something.</p>
+
+        <h3>Who presses Play</h3>
+        <div class="callout err">Stage execution belongs to the <strong>human operator</strong>. An AI
+          assistant working in this repo may read stage source, activity YAML, entity files and run logs; edit
+          stage code and configuration on request; compile CoffeeScript statically; and read non-executing
+          HTTP metadata/view endpoints. It must <strong>not</strong> click Play or Run selection, call
+          <code>/api/run</code>, <code>/api/run/range</code> or <code>/api/dry-run</code>, run
+          <code>sheets run</code>/<code>sheets stop</code>, import a stage module to invoke
+          <code>gate</code>/<code>reduce</code>/<code>rpc</code> directly, or treat a rendered view as proof
+          that a reducer ran. A stage result is not real until the operator confirms it from the UI or the run
+          log.</div>
+
+        <h3 style="margin-top:18px">Keep stages thin — logic lives in libs</h3>
+        <p class="lead">A stage file should be the contract exports plus call-throughs. Real logic goes in
+          <code>.sheets/lib/</code>, split by <em>which loader evaluates it</em> (§03):</p>
+        <div class="tbl">
+          <table>
+            <thead><tr><th>File</th><th>Loader</th><th>May use</th></tr></thead>
+            <tbody>
+              <tr><td><code>.sheets/lib/&lt;domain&gt;.mjs</code></td><td>server only — dynamic <code>import()</code> inside <code>reduce</code></td><td><code>node:*</code>, <code>fetch</code>, credentials, fs</td></tr>
+              <tr><td><code>.sheets/lib/views.mjs</code></td><td>browser + server — static import</td><td>DOM-safe JS only; every renderer</td></tr>
+              <tr><td><code>.sheets/lib/cell.mjs</code></td><td>browser + server — static import</td><td>escape / display / badge helpers</td></tr>
+              <tr><td><code>.sheets/stages/&lt;slug&gt;.coffee</code></td><td>both</td><td>meta / gate / reduce / views only</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 style="margin-top:18px">The gate and the cell must share ONE eligibility function</h3>
+        <p class="lead">A cell that says "run me" for a row the gate silently parks as <code>idle</code> is the
+          most confusing failure in the grid — nothing errors, nothing happens. Put the predicate in one pure,
+          browser-safe lib function and let both sides consume it.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">one predicate, two consumers</span><span class="fill"></span></div>
+          <pre><code># lib/views.mjs — returns { eligible, status, reason }
+import { promoteEligibility } from '../lib/views.mjs'
+
+export gate = (entity) -&gt; promoteEligibility(entity).eligible
+
+export views =
+  cell: (entity) -&gt;
+    { status, reason } = promoteEligibility entity
+    template: "&lt;span&gt;#{esc status} — #{esc reason}&lt;/span&gt;"</code></pre>
+        </div>
+        <div class="callout" style="margin-top:10px">One place to change, and the two can never disagree.
+          Corollary: an ineligible cell should <strong>name its blocker</strong> — <code>SUPPRESSED —
+          duplicate of an existing target</code> — and link the evidence. "Not run yet" is a lie when the gate
+          will never admit it.</div>
+
+        <h3 style="margin-top:18px">Know which of the three kinds of stage you are writing</h3>
+        <div class="tbl">
+          <table>
+            <thead><tr><th>Kind</th><th>Writes</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Prover</strong></td><td>entity evidence only</td><td>proves a field is valid and records the proof</td></tr>
+              <tr><td><strong>Repairer</strong></td><td>the staged remote object</td><td>applies the proven decision to the real object</td></tr>
+              <tr><td><strong>Transporter</strong></td><td>moves the object</td><td><code>promote</code> copies staging → target</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn" style="margin-top:10px"><strong>The trap:</strong> a prover writing
+          <code>evidence: ok</code> changes <em>nothing</em> remote. A transporter that faithfully copies the
+          staged object will happily ship the old value, and the entity will claim one thing while the live
+          object does another. Decide explicitly which stage <em>applies</em> a decision — otherwise every
+          column is individually correct and the pipeline is still wrong.</div>
+
+        <h3 style="margin-top:18px">Classify infrastructure failures separately from semantic ones</h3>
+        <div class="callout">A <code>401</code>, a timeout, or an empty result must never be recorded as "the
+          field is missing." Give it a distinct status — <code>UNVERIFIED</code> — so a stale credential
+          doesn't send someone off to fix a value that was never broken. Deterministic-first, and let verdicts
+          stay honest; that is the whole value of the grid.</div>
+
+        <h3 style="margin-top:18px">Resolve remote dependencies by semantics, never by id</h3>
+        <p class="lead">The same logical object usually exists under a different id in every namespace.
+          Matching by id creates duplicates; matching by meaning finds the one that is already there.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="cap">match, then remap references</span><span class="fill"></span></div>
+          <pre><code>hit = await findByMeaning target, pattern, reviewedKey
+if hit.found
+  remap.set dep.id, hit.found.id     # reuse it; import nothing
+# rewrite references[] through `remap` before importing anything</code></pre>
+        </div>
+
+        <h3 style="margin-top:18px">Write every receipt key on every run</h3>
+        <div class="callout warn">Patches merge <strong>per field</strong> (§09), so any key a later run does
+          not write survives from the previous run. A <code>REFUSED</code> receipt once inherited
+          <code>import_errors</code> from an earlier <code>FAILED</code> run and looked like both had
+          happened. Emit the full key set with <code>null</code>/<code>[]</code> defaults, then spread the
+          run's evidence over it.</div>
+
+        <h3 style="margin-top:18px">Irreversible stages need an explicit commit boundary</h3>
+        <ul class="list">
+          <li>Do every refusal <strong>before</strong> the first remote write, and record which guard stopped
+            it (a <code>step</code> field) so a refusal is attributable to one operation.</li>
+          <li>Keep the destructive tail behind an env flag until the proof actually justifies it.</li>
+          <li>Don't let a structural check masquerade as a behavioural one. Readback + reference closure +
+            item census proves the shape rendered, not that it <em>works</em>. Name the proof kind in the
+            receipt.</li>
+          <li>When a write succeeded but proof failed, return a distinct status (<code>PARTIAL</code>), never
+            delete the source, and list the created objects for reconciliation.</li>
+        </ul>
+
+        <h3 style="margin-top:18px">Model configuration</h3>
+        <p class="lead">Resolution order is <code>meta.model</code> → <code>.sheets/config.yaml</code> →
+          <code>$FAV_LOCAL_LLM</code> → AGL default (§05). Prefer setting <code>FAV_LOCAL_LLM</code> in your
+          shell rc over pinning a model in files — a pinned <code>meta.model</code> outlives its usefulness and
+          silently overrides everyone else's choice. The chat model dropdown is the union of the agent
+          definition's <code>models</code> array, its <code>model</code>, the active model, the workspace
+          model, and <code>$FAV_LOCAL_LLM</code>; a model absent from all of those will not appear.</p>
+      </section>
+
+      <section id="checklist" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">§24</span><span class="sec-tag">ship checklist</span></div>
+        <h2>Before Play</h2>
+        <div class="tbl check">
+          <table>
+            <tr><td>☐</td><td>File at <code>.sheets/stages/&lt;slug&gt;.coffee</code> and activity references <code>{stage: &lt;slug&gt;}</code></td></tr>
+            <tr><td>☐</td><td><code>meta.writes</code> matches patch keys</td></tr>
+            <tr><td>☐</td><td><code>gate</code> checks upstream only; <code>reduce</code> handles idempotent skip</td></tr>
+            <tr><td>☐</td><td><code>reduce</code> returns a patch and throws on failure; side effects are deliberate, cancellable via <code>ctx.signal</code>, and safe to re-play</td></tr>
+            <tr><td>☐</td><td><code>views.cell</code> returns <code>{template: '…'}</code> with escaped values; <code>.cell-tall</code> for multi-line</td></tr>
+            <tr><td>☐</td><td>LLM stages use <code>output_tool</code> + <code>ctx.onAgent</code> + <code>#{ctx.yaml entity}</code></td></tr>
+            <tr><td>☐</td><td><code>views.mount</code> returns an unmount fn; controls gated on <code>ctx.canPersist()</code></td></tr>
+            <tr><td>☐</td><td><code>rpc</code> throws on an unknown <code>method</code>; irreversible actions are state-gated and named</td></tr>
+            <tr><td>☐</td><td>Compiles: <code>GET /api/stage/&lt;slug&gt;</code> ok; <code>GET /stagemod/stages/&lt;slug&gt;.mjs</code> 200</td></tr>
+            <tr><td>☐</td><td>Operator has reviewed selection, gate, and expected patch</td></tr>
+          </table>
+        </div>
+        <div class="callout err" style="margin-top:12px"><strong>Safety boundary:</strong> the agent never
+          presses Play. Stage execution — <code>/api/run</code>, <code>/api/run/range</code>,
+          <code>/api/dry-run</code>, <code>sheets run</code> — belongs to the human operator, who confirms the
+          result from the UI or run log.</div>
+      </section>
+
+      <!-- ── refs ──────────────────────────────────── -->
+      <section id="refs" class="card">
+        <span class="num"></span>
+        <div class="sec-head"><span class="sec-no">→</span><span class="sec-tag">references</span></div>
+        <h2>Sources</h2>
+        <ul class="list">
+          <li><code>src/stages.coffee</code> — compile/cache/load, file URL import, lib version stamping</li>
+          <li><code>src/engine.coffee</code> — queue, gate FSM, locks, timeout, logs, durable runs</li>
+          <li><code>src/entities.coffee</code> — <code>mergePatch</code>, <code>setAtPath</code>, <code>deepFreeze</code>, YAML/MD I/O</li>
+          <li><code>templates/angela.coffee</code> — Angela stage-author prompt &amp; contract template</li>
+          <li><code>SKILL.md</code> — safety boundary, RPC, troubleshooting</li>
+          <li><a href="examples/fruit/.sheets/stages/"><code>docs/examples/fruit/.sheets/stages/*.coffee</code></a> — canonical examples</li>
+        </ul>
+        <div class="hr"></div>
+        <div class="foot">Generated 2026-08-07 · <b>sheets</b> stage contract · <code>tmp/stage-v2.html</code></div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<div class="to-top" id="top" title="Back to top">↑</div>
+
+<script>
+(function(){
+  /* ── CoffeeScript-ish highlighter (text-safe: only wraps, never drops) ── */
+  var KW = /\b(export|await|return|throw|new|unless|then|if|else|and|or|not|is|isnt|for|in|of|when|switch|try|catch|do|yes|no|on|off|true|false|null|undefined|typeof|delete)\b/g;
+  var esc = function(s){
+    return s.replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; });
+  };
+  var rest = function(s){
+    return esc(s)
+      .replace(KW, '<span class="t-kw">$1</span>')
+      .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="t-num">$1</span>')
+      .replace(/\b([A-Za-z_$][\w$]*)(?=\s*:(?!:))/g, '<span class="t-prop">$1</span>')
+      .replace(/\b(ctx|meta|entity|agent|args)\b/g, '<span class="t-fn">$1</span>');
+  };
+  var TOK = /(#(?!\{)[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(\/(?:\[(?:[^\]\\]|\\.)*\]|[^\/\\\n\[])+\/[gimsuy]*)/g;
+
+  document.querySelectorAll('.code pre code').forEach(function(el){
+    var src = el.textContent, out = '', last = 0, m;
+    TOK.lastIndex = 0;
+    while ((m = TOK.exec(src)) !== null){
+      out += rest(src.slice(last, m.index));
+      if (m[1])      out += '<span class="t-com">' + esc(m[1]) + '</span>';
+      else if (m[2]) out += '<span class="t-str">' + esc(m[2]) + '</span>';
+      else           out += '<span class="t-re">'  + esc(m[3]) + '</span>';
+      last = m.index + m[0].length;
+    }
+    out += rest(src.slice(last));
+    el.innerHTML = out;
+  });
+
+  /* ── copy buttons ── */
+  document.querySelectorAll('.code').forEach(function(box){
+    var code = box.querySelector('code'), bar = box.querySelector('.bar');
+    if (!code || !bar) return;
+    var btn = document.createElement('button');
+    btn.className = 'copy'; btn.textContent = 'copy';
+    btn.addEventListener('click', function(){
+      navigator.clipboard.writeText(code.textContent).then(function(){
+        btn.textContent = 'copied'; btn.classList.add('done');
+        setTimeout(function(){ btn.textContent = 'copy'; btn.classList.remove('done'); }, 1400);
+      });
+    });
+    bar.appendChild(btn);
+  });
+
+  /* ── scrollspy + progress + back-to-top ── */
+  var links = [].slice.call(document.querySelectorAll('#toc a'));
+  var map = {}; links.forEach(function(a){ map[a.getAttribute('href').slice(1)] = a; });
+  var secs = [].slice.call(document.querySelectorAll('main section.card'));
+
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (!e.isIntersecting) return;
+      links.forEach(function(a){ a.classList.remove('active'); });
+      var a = map[e.target.id];
+      if (a){
+        a.classList.add('active');
+        var t = document.getElementById('toc');
+        if (a.offsetTop < t.scrollTop || a.offsetTop > t.scrollTop + t.clientHeight - 40){
+          t.scrollTop = a.offsetTop - t.clientHeight / 2;
+        }
+      }
+    });
+  }, { rootMargin: '-70px 0px -68% 0px', threshold: 0 });
+  secs.forEach(function(s){ io.observe(s); });
+
+  var prog = document.getElementById('prog'), top = document.getElementById('top');
+  var tick = function(){
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    prog.style.width = (h > 0 ? (window.scrollY / h) * 100 : 0) + '%';
+    top.classList.toggle('show', window.scrollY > 600);
+  };
+  window.addEventListener('scroll', tick, { passive: true });
+  window.addEventListener('resize', tick);
+  top.addEventListener('click', function(){ window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  tick();
+})();
+</script>
+</body>
+</html>

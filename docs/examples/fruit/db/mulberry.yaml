@@ -1,0 +1,9 @@
+produce:
+  name: mulberry
+appearance:
+  color: '#4a235a'
+animal:
+  name: Fruit bat
+  noise: A wet, rhythmic squelch echoes as the fruit bat's velvet muzzle presses into
+    the deep violet pulp, accompanied by a faint, sticky popping sound as the juice
+    bursts against its teeth.

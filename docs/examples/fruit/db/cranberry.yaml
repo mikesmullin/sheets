@@ -1,0 +1,8 @@
+produce:
+  name: cranberry
+  volume_inches_cubed: 0.15
+appearance:
+  color: '#9b1d20'
+animal:
+  name: Wild turkey
+  noise: null

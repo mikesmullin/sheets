@@ -1,0 +1,9 @@
+produce:
+  name: cherry
+  volume_inches_cubed: 0.35
+appearance:
+  color: '#c1121f'
+animal:
+  name: Cedar waxwing
+  noise: null
+  sleep_pattern: Diurnal

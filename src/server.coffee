@@ -17,6 +17,11 @@ import { createChatApi } from './chat.mjs'
 PKG_ROOT = path.resolve path.dirname(fileURLToPath(import.meta.url)), '..'
 PUBLIC = path.join PKG_ROOT, 'public'
 
+# Angela's scaffolded agent imports the stage contract (docs/index.html) at load
+# time. Chat runs in this process, so publish the package root rather than making
+# a workspace-local agent file guess at install layouts.
+process.env.SHEETS_PKG_ROOT ?= PKG_ROOT
+
 MIME =
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript'
   '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml'

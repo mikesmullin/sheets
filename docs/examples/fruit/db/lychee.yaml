@@ -1,0 +1,10 @@
+produce:
+  name: lychee
+appearance:
+  color: '#e57373'
+animal:
+  name: Flying fox
+  noise: >-
+    The flying fox lets out a wet, rhythmic squelch as its leathery muzzle
+    presses against the fruit, accompanied by the soft, tacky peeling of the
+    rosy-red skin and the muffled pop of succulent pulp yielding to its teeth.

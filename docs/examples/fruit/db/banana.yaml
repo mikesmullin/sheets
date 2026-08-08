@@ -1,0 +1,13 @@
+produce:
+  name: banana
+  volume_inches_cubed: 12
+appearance:
+  color: '#f5d547'
+animal:
+  name: Capuchin monkey
+  noise: >-
+    The Capuchin monkey produces a series of wet, rhythmic smacking sounds and
+    rapid-fire 'mlem' noises as it peels the vibrant, lemon-yellow skin. Each
+    bite is punctuated by a soft, squelching pop of pulp against its palate,
+    followed by a satisfied, high-pitched chittering of delight.
+  sleep_pattern: Diurnal

@@ -1,0 +1,22 @@
+title: Fruit
+rows:
+  source: db/
+columns:
+  - stage: fruit-color
+  - stage: average-volume-each-fruit-inches
+  - stage: fruit-eater
+  - stage: animal-sleep
+    width: 209
+  - stage: color-fruit-animal-eats-describe
+  - field: appearance.color
+    hidden: true
+  - field: produce.name
+    hidden: true
+  - field: produce.volume_inches_cubed
+    hidden: true
+  - field: animal.name
+    hidden: true
+  - field: animal.noise
+    hidden: true
+component_locks: {}
+revision: 107

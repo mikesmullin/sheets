@@ -1,0 +1,11 @@
+produce:
+  name: mango
+appearance:
+  color: '#ff9800'
+animal:
+  name: Indian flying fox
+  noise: >-
+    The Indian flying fox emits a series of wet, rhythmic squelches and soft,
+    succulent smacks as its large teeth tear into the vibrant orange flesh,
+    accompanied by the low, satisfied hum of its throat vibrating against the
+    fruit's pulp.

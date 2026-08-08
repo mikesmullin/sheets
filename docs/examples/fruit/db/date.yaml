@@ -1,0 +1,7 @@
+produce:
+  name: date
+appearance:
+  color: '#7b3f00'
+animal:
+  name: Dromedary camel
+  noise: null

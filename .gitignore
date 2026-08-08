@@ -7,5 +7,4 @@ node_modules/
 **/.angela/sessions/
 
 # testing
-/examples/
 /test/

@@ -1,0 +1,8 @@
+produce:
+  name: elderberry
+  volume_inches_cubed: 0.05
+appearance:
+  color: '#311b4b'
+animal:
+  name: Fruit bat
+  noise: null

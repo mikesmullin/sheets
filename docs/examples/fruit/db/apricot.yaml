@@ -1,0 +1,8 @@
+produce:
+  name: apricot
+  volume_inches_cubed: 1.5
+appearance:
+  color: '#fb9c5a'
+animal:
+  name: Ring-tailed lemur
+  sleep_pattern: Diurnal

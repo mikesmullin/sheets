@@ -1,0 +1,9 @@
+produce:
+  name: plantain
+appearance:
+  color: '#d4a017'
+animal:
+  name: Fruit bat
+  noise: The fruit bat emits a rhythmic, wet squelch as its teeth pierce the golden-hued
+    rind, followed by the muffled, sticky sound of pulpy mash being pressed against
+    its palate.

@@ -1,0 +1,8 @@
+animal:
+  name: Black bear
+  sleep_pattern: Nocturnal and hibernates
+produce:
+  name: apple
+  volume_inches_cubed: 15.5
+appearance:
+  color: '#c0392b'

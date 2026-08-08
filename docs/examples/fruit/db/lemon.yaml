@@ -1,0 +1,11 @@
+produce:
+  name: lemon
+appearance:
+  color: '#f7e733'
+animal:
+  name: Vervet monkey
+  noise: >-
+    The vervet monkey lets out a series of high-pitched, rhythmic squeaks as its
+    face puckers, followed by the wet, rapid 'smack-crunch' of teeth hitting the
+    tart, citrus flesh. Between bites, it emits a sharp, vibrating trill of
+    acidic surprise that echoes against the bright yellow rind.

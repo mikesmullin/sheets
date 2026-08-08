@@ -1,0 +1,9 @@
+produce:
+  name: plum
+appearance:
+  color: '#6a1b5d'
+animal:
+  name: Fruit bat
+  noise: A wet, rhythmic squelch echoes as the bat's teeth puncture the taut skin,
+    followed by a muffled, suction-like slurping sound as it pulls the deep violet
+    pulp into its mouth.

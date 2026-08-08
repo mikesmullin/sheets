@@ -1,0 +1,12 @@
+produce:
+  name: blueberry
+  volume_inches_cubed: 0.15
+appearance:
+  color: '#355c9a'
+animal:
+  name: American robin
+  noise: >-
+    The robin lets out a series of wet, rhythmic 'taps' as its beak punctures
+    the skins, followed by a muffled, liquid 'pop' as the deep blue pulp yields
+    and dissolves against its tongue.
+  sleep_pattern: Diurnal

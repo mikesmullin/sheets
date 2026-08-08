@@ -1,0 +1,12 @@
+[submodule "docs/m-js"]
+	path = docs/m-js
+	url = https://github.com/mikesmullin/m-js
+	branch = v3
+[submodule "docs/agl"]
+	path = docs/agl
+	url = https://github.com/mikesmullin/agl
+	branch = main
+[submodule "docs/m-js-docs"]
+	path = docs/m-js-docs
+	url = https://github.com/mikesmullin/m-js
+	branch = docs

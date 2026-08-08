@@ -1,0 +1,4 @@
+# sheets workspace config
+# model: lm-studio:google/gemma-4-12b-qat
+concurrency: 1
+indexes: []

@@ -1,0 +1,22 @@
+# The fruit sample dataset is committed so anyone can clone and run it.
+# Everything a running server generates is not.
+
+# Ignore everything by default...
+*
+!*/
+!.gitignore
+
+# ...except the sample dataset itself.
+!fruit/.sheets/config.yaml
+!fruit/.sheets/activities/**
+!fruit/.sheets/stages/**
+!fruit/db/**
+
+# ...and never these runtime artifacts. (Re-ignored explicitly: the broad
+# un-ignore rules above would otherwise override the repo-root .gitignore.)
+fruit/db/.lock
+fruit/.sheets/server.json
+fruit/.sheets/pgdata/
+fruit/.sheets/runs/
+fruit/.sheets/.compiled-stages/
+fruit/.angela/

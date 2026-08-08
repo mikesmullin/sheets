@@ -1,0 +1,13 @@
+produce:
+  name: clementine
+appearance:
+  color: '#f77f00'
+animal:
+  name: Orangutan
+  noise: >-
+    The orangutan lets out a wet, rhythmic squelch as its powerful jaw crushes
+    the vibrant orange pulp, punctuated by a low, satisfied hoot that vibrates
+    through its chest. With every forceful bite, there is a juicy explosion of
+    zest and a soft, sticky suction sound as the peel is pulled away from the
+    fruit's core.
+  sleep_pattern: Diurnal

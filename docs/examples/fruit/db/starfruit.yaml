@@ -1,0 +1,6 @@
+produce:
+  name: starfruit
+appearance:
+  color: '#d4e157'
+animal:
+  name: Fruit bat

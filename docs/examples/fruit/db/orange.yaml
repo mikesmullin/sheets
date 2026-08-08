@@ -1,0 +1,12 @@
+produce:
+  name: orange
+  volume_inches_cubed: 125
+appearance:
+  color: '#f57c00'
+animal:
+  name: Orangutan
+  noise: >-
+    The orangutan lets out a deep, wet crunch as its teeth puncture the vibrant,
+    sunset-orange rind, followed by a rhythmic, squelching series of gulps as
+    the pulpy juice coats its throat.
+  sleep_pattern: Diurnal

@@ -1,0 +1,8 @@
+produce:
+  name: dragonfruit
+  volume_inches_cubed: 120
+appearance:
+  color: '#ec407a'
+animal:
+  name: Fruit bat
+  noise: null

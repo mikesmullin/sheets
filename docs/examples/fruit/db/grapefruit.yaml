@@ -1,0 +1,7 @@
+produce:
+  name: grapefruit
+  volume_inches_cubed: 250
+appearance:
+  color: '#f68b6b'
+animal:
+  name: Kinkajou

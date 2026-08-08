@@ -1,0 +1,8 @@
+produce:
+  name: cantaloupe
+  volume_inches_cubed: 180
+appearance:
+  color: '#f4a261'
+animal:
+  name: Raccoon
+  sleep_pattern: Nocturnal

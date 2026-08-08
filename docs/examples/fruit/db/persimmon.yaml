@@ -1,0 +1,9 @@
+produce:
+  name: persimmon
+appearance:
+  color: '#e65100'
+animal:
+  name: Fruit bat
+  noise: The fruit bat emits a series of wet, rhythmic squelches and soft, clicking
+    mastications as its teeth sink into the burnt-orange flesh, accompanied by a faint,
+    sandpaper-like rasp of fur brushing against the sticky skin.

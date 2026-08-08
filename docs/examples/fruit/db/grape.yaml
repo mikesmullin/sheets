@@ -1,0 +1,11 @@
+produce:
+  name: grape
+appearance:
+  color: '#6d3f8f'
+animal:
+  name: European starling
+  noise: >-
+    The European starling emits a series of rapid, rhythmic clicks and wet,
+    muffled pops as its beak crushes the deep violet skin of the grape. Each
+    swallow is accompanied by a soft, velvety squelch that mirrors the richness
+    of the fruit's dark hue.

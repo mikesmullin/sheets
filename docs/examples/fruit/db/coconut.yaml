@@ -1,0 +1,7 @@
+produce:
+  name: coconut
+appearance:
+  color: '#795548'
+animal:
+  name: Coconut crab
+  noise: null

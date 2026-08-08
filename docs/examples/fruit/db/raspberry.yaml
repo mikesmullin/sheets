@@ -1,0 +1,6 @@
+produce:
+  name: raspberry
+appearance:
+  color: '#c2185b'
+animal:
+  name: Red fox

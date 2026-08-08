@@ -1,0 +1,11 @@
+produce:
+  name: currant
+  volume_inches_cubed: 0.015
+appearance:
+  color: '#4a001f'
+animal:
+  name: Fruit bat
+  noise: >-
+    The fruit bat makes a series of wet, rhythmic clicking sounds as its tiny
+    teeth pierce the skins, followed by a soft, squelching slurp as the deep
+    burgundy juice coats its palate.

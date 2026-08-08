@@ -1,0 +1,12 @@
+produce:
+  name: papaya
+  volume_inches_cubed: 150
+appearance:
+  color: '#ff7043'
+animal:
+  name: Toucan
+  noise: >-
+    With a rhythmic, wet 'thwack-squelch', the toucan’s massive beak shears
+    through the sunset-orange flesh, producing a hollow, pulpy suction sound as
+    it swallows the buttery fruit.
+  sleep_pattern: Nocturnal

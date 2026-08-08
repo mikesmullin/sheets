@@ -1,0 +1,8 @@
+produce:
+  name: blackberry
+  volume_inches_cubed: 0.5
+appearance:
+  color: '#2d1839'
+animal:
+  name: Red fox
+  sleep_pattern: Nocturnal and crepuscular

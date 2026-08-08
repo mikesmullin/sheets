@@ -1,0 +1,13 @@
+produce:
+  name: olive
+  volume_inches_cubed: 0.35
+appearance:
+  color: '#708238'
+animal:
+  name: Fruit bat
+  noise: >-
+    The fruit bat emits a series of wet, rhythmic smacks and rapid, sticky
+    squelches as it mashes the mossy-green olive pulp against the roof of its
+    mouth. Each swallow is punctuated by a tiny, muffled pop as the fruit's skin
+    yields to its keen teeth.
+  sleep_pattern: Nocturnal
